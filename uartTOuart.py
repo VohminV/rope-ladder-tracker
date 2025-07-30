@@ -7,19 +7,18 @@ import json
 import logging
 import math
 import threading
-from pymavlink import mavutil
 
 # Настройка логгера
 logging.basicConfig(
     level=logging.INFO,  # Уровень логирования (можно DEBUG для более подробного вывода)
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("/home/orangepi/Documents/YOLO/uart_forwarder.log"),  # Лог в файл
+        logging.FileHandler("/home/orangepi/uart_forwarder.log"),  # Лог в файл
         logging.StreamHandler()  # Также вывод в консоль
     ]
 )
 
-FLAG_PATH = '/home/orangepi/Documents/YOLO/tracking_enabled.flag'
+FLAG_PATH = '/home/orangepi/tracking_enabled.flag'
 def set_tracking(enabled: bool):
     tmp_path = FLAG_PATH + '.tmp'
     try:
@@ -116,8 +115,8 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     
     angle = 0
     
-    FRAME_WIDTH = 720
-    FRAME_HEIGHT = 576
+    FRAME_WIDTH = 640
+    FRAME_HEIGHT = 480
 
     MAX_OFFSET_X_PX = FRAME_WIDTH // 2     # 360
     MAX_OFFSET_Y_PX = FRAME_HEIGHT // 2    # 288
@@ -162,13 +161,13 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         def scale_offset_y_to_ticks(offset_px):
             return int(offset_px * MAX_DEFLECTION_TICKS / MAX_OFFSET_Y_PX)
     
-        roll_ticks = scale_offset_x_to_ticks(offset_x)
-        pitch_ticks = scale_offset_y_to_ticks(offset_y)
+        roll_ticks = scale_offset_x_to_ticks(-offset_x)
+        pitch_ticks = scale_offset_y_to_ticks(-offset_y)
 
         channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + roll_ticks))
         channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + pitch_ticks))
 
-        if angle < -5 or angle > 5: # мёртвая зона, чтобы не дёргался на шум
+        """if angle < -5 or angle > 5: # мёртвая зона, чтобы не дёргался на шум
             yaw_error = angle  # компенсируем поворот (если угол > 0, надо крутить вправо)
     
             yaw_error_limited = max(-30, min(30, yaw_error))  # ограничим диапазон
@@ -179,7 +178,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     
             channels_old[3] = yaw_channel
         else:
-            channels_old[3] = CENTER_TICKS
+            channels_old[3] = CENTER_TICKS"""
     
         packed_channels = pack_channels(channels_old)
         data_without_crc_old[3:25] = packed_channels

@@ -28,14 +28,14 @@ BACKTRACK_MARGIN = 5.0           # запас при возврате
 TARGET_FPS = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
-FLAG_PATH = 'tracking_enabled.flag'
+FLAG_PATH = '/home/orangepi/tracking_enabled.flag'
 
 # --- Логирование ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("motion_tracker.log", encoding='utf-8'),
+        #logging.FileHandler("/home/orangepi/motion_tracker.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -246,7 +246,7 @@ def main():
             elapsed = time.time() - start_time
             if elapsed >= 1.0:
                 fps = frame_count / elapsed
-                logging.info(f"📊 {fps:.1f} FPS | dx={final_dx:+.3f}м | dy={final_dy:+.3f}м | WPs={len(waypoints)}")
+                logging.info(f"📊 {fps:.1f} FPS | dx={dx_px:+.3f}м | dy={dy_px:+.3f}м | WPs={len(waypoints)}")
                 frame_count = 0
                 start_time = time.time()
 
