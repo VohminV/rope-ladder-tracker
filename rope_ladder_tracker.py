@@ -173,6 +173,7 @@ def main():
     anchor_center = np.mean(np.array(tracked_points).reshape(-1, 2), axis=0)
     add_waypoint(waypoints, tracked_points, frame_idx=frame_idx)
 
+    # === ⚙️ Параметры LK ===
     lk_params = dict(
         winSize=(21, 21),
         maxLevel=3,
@@ -183,10 +184,14 @@ def main():
     frame_count = 0
     start_time = time.time()
 
+    # === 🔁 Состояние трекинга ===
+    tracking_active = False
+
     try:
         while True:
             loop_start = time.time()
 
+            # --- Захват кадра ---
             ret, frame = cap.read()
             if not ret or frame is None:
                 logging.warning("⚠️ Пустой кадр — пропуск")
@@ -196,47 +201,72 @@ def main():
             frame_idx += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+            # --- Проверка включения трекинга ---
+            tracking_now = is_tracking_enabled()
+
+            if not tracking_now:
+                if tracking_active:
+                    logging.info("🔴 Трекинг остановлен. Сброс waypoints.")
+                    waypoints.clear()
+                save_offset(0, 0)
+                tracking_active = False
+                prev_gray = gray  # 🔁 Обновляем для стабильности
+                time.sleep(FRAME_INTERVAL)
+                continue
+            else:
+                if not tracking_active:
+                    logging.info("🟢 Трекинг включён. Устанавливаем новый старт.")
+                    # Перезапускаем с текущего кадра
+                    fresh_points = adaptive_good_features(gray)
+                    if fresh_points is not None and len(fresh_points) >= MIN_FEATURES:
+                        waypoints.clear()
+                        add_waypoint(waypoints, fresh_points, frame_idx=0)
+                        tracked_points = fresh_points.copy()  # ✅ Синхронизация
+                        logging.info("🔄 Новый старт установлен.")
+                    else:
+                        logging.warning("⚠️ Нет точек для старта — пропуск кадра")
+                        save_offset(0, 0)
+                        prev_gray = gray
+                        continue
+                    tracking_active = True
+
             # --- Отслеживание ---
             new_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, tracked_points, None, **lk_params)
             if new_points is None or status is None:
-                tracked_points = adaptive_good_features(gray)
-                if tracked_points is None:
-                    tracked_points = np.array([])
-                prev_gray = gray
+                #logging.warning("⚠️ Ошибка LK — перезапуск")
+                #fresh = adaptive_good_features(gray)
+                #tracked_points = fresh.copy() if fresh is not None else np.array([])
+                #prev_gray = gray
                 continue
 
             good_indices = [i for i, s in enumerate(status) if s == 1]
-            if len(good_indices) < MIN_FEATURES:
-                tracked_points = adaptive_good_features(gray)
-                if tracked_points is None:
-                    tracked_points = np.array([])
-            else:
-                tracked_points = new_points[good_indices]
+            tracked_points = new_points[good_indices]
 
-            prev_gray = gray.copy()
-            
+            prev_gray = gray  # ✅ Всегда обновляем
+
             # === 🔒 Защита от пустых точек ===
             if tracked_points is None or len(tracked_points) == 0:
-                # Сохраняем 0,0 — как "потеряли трекинг"
                 save_offset(0, 0)
                 logging.warning("⚠️ Нет точек — сохраняем (0, 0)")
                 continue
 
-
             # === 🪜 Управление "лестницей" ===
             rope_ladder_waypoint_management(waypoints, tracked_points, current_angle=None)
 
-
             # === 🏠 Проверка: вернулись ли в старт? ===
-            current_center = np.mean(np.array(tracked_points).reshape(-1, 2), axis=0)
-            anchor_center = waypoints[0]['center']
-            dist_to_start = np.linalg.norm(current_center - anchor_center)
+            try:
+                current_center = np.mean(np.array(tracked_points).reshape(-1, 2), axis=0)
+                anchor_center = waypoints[0]['center']
+                dist_to_start = np.linalg.norm(current_center - anchor_center)
+            except Exception as e:
+                logging.warning(f"⚠️ Ошибка вычисления центра: {e}")
+                save_offset(0, 0)
+                continue
 
             if dist_to_start < DISTANCE_THRESHOLD:
                 save_offset(0, 0)
                 logging.info(f"🎯 ВОЗВРАТ В СТАРТ! (dist={dist_to_start:.1f}px)")
             else:
-                # Смещение от текущего к стартовому
                 dx_px = anchor_center[0] - current_center[0]
                 dy_px = anchor_center[1] - current_center[1]
                 save_offset(int(dx_px), int(dy_px))
@@ -246,16 +276,16 @@ def main():
             elapsed = time.time() - start_time
             if elapsed >= 1.0:
                 fps = frame_count / elapsed
-                logging.info(f"📊 {fps:.1f} FPS | dx={dx_px:+.3f}м | dy={dy_px:+.3f}м | WPs={len(waypoints)}")
+                logging.info(f"📊 {fps:.1f} FPS | dx={int(dx_px):+6d} | dy={int(dy_px):+6d} | WPs={len(waypoints)}")
                 frame_count = 0
                 start_time = time.time()
 
             # === 🖼️ Визуализация ===
             if SHOW_DISPLAY:
                 display = frame.copy()
-                status = "HOME" if dist_to_start < DISTANCE_THRESHOLD else f"WP {len(waypoints)-1}"
+                status_text = "HOME" if dist_to_start < DISTANCE_THRESHOLD else f"WP {len(waypoints)-1}"
                 color = (0, 255, 0) if dist_to_start < DISTANCE_THRESHOLD else (255, 165, 0)
-                cv2.putText(display, status, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                cv2.putText(display, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
                 cv2.putText(display, f"WPs: {len(waypoints)}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
                 for pt in tracked_points:
                     cv2.circle(display, (int(pt[0][0]), int(pt[0][1])), 2, (255, 0, 0), -1)
