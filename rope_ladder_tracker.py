@@ -28,7 +28,7 @@ BACKTRACK_MARGIN = 5.0           # запас при возврате
 TARGET_FPS = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
-FLAG_PATH = '/home/orangepi/tracking_enabled.flag'
+FLAG_PATH = 'tracking_enabled.flag'
 
 # --- Логирование ---
 logging.basicConfig(
