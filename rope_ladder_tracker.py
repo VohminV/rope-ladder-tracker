@@ -22,11 +22,13 @@ IMAGE_HEIGHT_PX = 480
 TARGET_FPS = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
-MIN_FEATURES = 20 # Уменьшено для большей гибкости
+# --- Параметры трекинга и лестницы ---
+MIN_FEATURES = 20 # Уменьшено для большей гибкости (x,y -> 10 точек)
 DISTANCE_THRESHOLD = 25.0 # порог добавления новой точки (пиксели) - увеличено
 BACKTRACK_MARGIN = 15.0   # минимальное "продвижение" назад - увеличено
 HYSTERESIS_MARGIN = 10.0  # "мертвая зона" - увеличено
-
+LADDER_UPDATE_INTERVAL = 0.5 # Интервал обновления логики лестницы (секунды)
+FLAG_PATH = 'tracking_enabled.flag'
 # --- Логирование ---
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +39,6 @@ logging.basicConfig(
         logging.FileHandler("rope_ladder.log", mode='w', encoding='utf-8')
     ]
 )
-
-FLAG_PATH = 'tracking_enabled.flag'
 
 # --- Функции ---
 
@@ -202,7 +202,7 @@ def rope_ladder_waypoint_management(waypoints, current_points, current_angle=Non
             if condition_2b:
                 logging.debug(f"[RLM] Условие 2b выполнено.")
                 add_waypoint(waypoints, current_points, current_angle, None)
-                logging.info(f"Добавлена новая точка (удаление от старта)")
+                logging.info(f"➕ Добавлена новая точка (удаление от старта)")
                 logging.debug(f"[RLM] После добавления новой точки: len(waypoints)={len(waypoints)}")
             else:
                 logging.debug(f"[RLM] Условие 2b НЕ выполнено.")
@@ -274,6 +274,9 @@ def main():
     frame_count = 0
     start_time = time.time()
 
+    # === 🕒 Таймер для верёвочной лестницы ===
+    last_ladder_update_time = 0.0
+
     try:
         while True:
             loop_start = time.time()
@@ -318,6 +321,7 @@ def main():
                         tracked_points = fresh_points.copy() # ✅ Синхронизация
                         logging.info("Новый старт установлен.")
                         prev_gray = gray.copy() # Обновляем prev_gray только при новом старте
+                        last_ladder_update_time = time.time() # Сброс таймера при новом старте
                     else:
                         logging.warning("Нет точек для старта — пропуск кадра")
                         save_offset(0, 0)
@@ -359,47 +363,63 @@ def main():
                     time.sleep(FRAME_INTERVAL)
                     continue
 
-                # === 🪜 Управление "лестницей" ===
-                if len(waypoints) > 0:
-                    # Передаем фиксированный якорь
-                    rope_ladder_waypoint_management(waypoints, tracked_points, current_angle=None, anchor_center_fixed=anchor_center_fixed)
-
-                    # --- Расчет и сохранение смещения ---
+                # === 🪜 Управление "лестницей" (с ограничением по времени) ===
+                current_time = time.time()
+                ladder_updated = False
+                if current_time - last_ladder_update_time >= LADDER_UPDATE_INTERVAL:
                     if len(waypoints) > 0:
+                        # Передаем фиксированный якорь
+                        rope_ladder_waypoint_management(waypoints, tracked_points, current_angle=None, anchor_center_fixed=anchor_center_fixed)
+                        # Обновляем время последнего обновления
+                        last_ladder_update_time = current_time
+                        ladder_updated = True
+
+                # --- Расчет и сохранение смещения ---
+                # ВАЖНО: Расчет смещения выполняется на КАЖДОМ кадре, независимо от таймера лестницы
+                if len(waypoints) > 0 and tracked_points is not None and len(tracked_points) > 0:
+                    try:
                         current_center = np.mean(np.array(tracked_points).reshape(-1, 2), axis=0)
                         start_center = anchor_center_fixed if anchor_center_fixed is not None else waypoints[0]['center']
                         dx_px = current_center[0] - start_center[0]
                         dy_px = current_center[1] - start_center[1]
                         save_offset(dx_px / FOCAL_LENGTH_X, dy_px / FOCAL_LENGTH_Y)
-                    else:
-                        dx_px, dy_px = 0, 0
+                    except Exception as e:
+                        logging.warning(f"Ошибка расчета смещения: {e}")
                         save_offset(0, 0)
+                        dx_px, dy_px = 0, 0
+                else:
+                    dx_px, dy_px = 0, 0
+                    save_offset(0, 0)
 
-                    # --- Отображение (если нужно) ---
-                    if SHOW_DISPLAY:
-                        display_frame = frame.copy()
-                        # Рисуем точки
+                # --- Отображение (если нужно) ---
+                if SHOW_DISPLAY:
+                    display_frame = frame.copy()
+                    # Рисуем точки
+                    if tracked_points:
                         for i in range(0, len(tracked_points), 2):
                             x, y = int(tracked_points[i]), int(tracked_points[i+1])
                             cv2.circle(display_frame, (x, y), 3, (0, 255, 0), -1)
 
-                        # Рисуем waypoints
-                        for i, wp in enumerate(waypoints):
-                            cx, cy = int(wp['center'][0]), int(wp['center'][1])
-                            color = (255, 0, 0) if i == 0 else (0, 0, 255)
-                            cv2.circle(display_frame, (cx, cy), 5, color, -1)
-                            cv2.putText(display_frame, f'WP{i}', (cx+5, cy+5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                    # Рисуем waypoints
+                    for i, wp in enumerate(waypoints):
+                        cx, cy = int(wp['center'][0]), int(wp['center'][1])
+                        color = (255, 0, 0) if i == 0 else (0, 0, 255)
+                        cv2.circle(display_frame, (cx, cy), 5, color, -1)
+                        cv2.putText(display_frame, f'WP{i}', (cx+5, cy+5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-                        # Инфо
-                        if dx_px is not None and dy_px is not None:
-                            cv2.putText(display_frame, f"dx: {dx_px:>+5.0f}px", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                            cv2.putText(display_frame, f"dy: {dy_px:>+5.0f}px", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(display_frame, f"WPs: {len(waypoints)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # Инфо
+                    if dx_px is not None and dy_px is not None:
+                        cv2.putText(display_frame, f"dx: {dx_px:>+5.0f}px", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_frame, f"dy: {dy_px:>+5.0f}px", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(display_frame, f"WPs: {len(waypoints)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # Индикатор обновления лестницы
+                    if ladder_updated:
+                        cv2.putText(display_frame, "RLM Updated", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-                        cv2.imshow("Rope Ladder Tracker", display_frame)
-                        if cv2.waitKey(1) & 0xFF == ord('q'):
-                            break
+                    cv2.imshow("Rope Ladder Tracker", display_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
 
                 # --- FPS ---
                 frame_count += 1
@@ -410,6 +430,8 @@ def main():
                         dx_m = (dx_px / FOCAL_LENGTH_X) if dx_px is not None else 0
                         dy_m = (dy_px / FOCAL_LENGTH_Y) if dy_px is not None else 0
                         logging.info(f"{fps:.1f} FPS | dx={dx_m*1000:>+5.0f} | dy={dy_m*1000:>+5.0f} | WPs={len(waypoints)}")
+                    else:
+                        logging.info(f"{fps:.1f} FPS | dx=    0 | dy=    0 | WPs={len(waypoints)}")
                     frame_count = 0
                     start_time = time.time()
 
