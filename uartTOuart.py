@@ -110,6 +110,13 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     MIN_TICKS = 172
     MAX_TICKS = 1811
     
+    # Глобальные переменные (или в объекте класса)
+    smoothed_offset_x = 0.0
+    smoothed_offset_y = 0.0
+    SMOOTHING_FACTOR_OFFSET = 0.3 # 0.0 (нет реакции) - 1.0 (без сглаживания). Попробуйте 0.2 - 0.5
+
+
+
     # Величина мёртвой зоны — до какого угла yaw не двигаем
     DEADZONE_ANGLE = 3  # например, 3°
     
@@ -120,9 +127,6 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
 
     MAX_OFFSET_X_PX = FRAME_WIDTH // 2     # 360
     MAX_OFFSET_Y_PX = FRAME_HEIGHT // 2    # 288
-
-    MAX_DEFLECTION_US = 300
-    MAX_DEFLECTION_TICKS = int(MAX_DEFLECTION_US * 8 / 5)
 
     ALT_SCALE = 100
     CLIMB_SCALE = 100
@@ -142,28 +146,20 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         try:
             with open('offsets.json', 'r') as f:
                 offsets = json.load(f)
-                offset_x = offsets.get('x', 0)
-                offset_y = offsets.get('y', 0)
+                new_offset_x = offsets.get('x', 0)
+                new_offset_y = offsets.get('y', 0)
                 angle = offsets.get('angle', 0)
         except:
-            offset_x = 0
-            offset_y = 0
+            new_offset_x = 0
+            new_offset_y = 0
             angle = 0
 
-        # Ограничиваем смещение
-        offset_x = max(-MAX_OFFSET_X_PX, min(offset_x, MAX_OFFSET_X_PX))
-        offset_y = max(-MAX_OFFSET_Y_PX, min(offset_y, MAX_OFFSET_Y_PX))
-
-        # Масштабируем в тики (по отдельности для X и Y)
-        def scale_offset_x_to_ticks(offset_px):
-            return int(offset_px * MAX_DEFLECTION_TICKS / MAX_OFFSET_X_PX)
-
-        def scale_offset_y_to_ticks(offset_px):
-            return int(offset_px * MAX_DEFLECTION_TICKS / MAX_OFFSET_Y_PX)
-    
-        roll_ticks = scale_offset_x_to_ticks(-offset_x)
-        pitch_ticks = scale_offset_y_to_ticks(-offset_y)
-
+        # Сглаживание
+        smoothed_offset_x = SMOOTHING_FACTOR_OFFSET * new_offset_x + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_x
+        smoothed_offset_y = SMOOTHING_FACTOR_OFFSET * new_offset_y + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_y
+        roll_ticks = int(round(smoothed_offset_x))
+        pitch_ticks = int(round(smoothed_offset_y))
+     
         channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + roll_ticks))
         channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + pitch_ticks))
 

@@ -15,8 +15,6 @@ import json
 import os
 
 # --- Настройки ---
-FOCAL_LENGTH_X = 300
-FOCAL_LENGTH_Y = 300
 IMAGE_WIDTH_PX = 640
 IMAGE_HEIGHT_PX = 480
 TARGET_FPS = 30
@@ -45,11 +43,9 @@ logging.basicConfig(
 # --- Функции ---
 def save_offset(dx_m, dy_m, angle=0.0):
     """Сохраняет смещение в JSON файл"""
-    x_px = int(dx_m * FOCAL_LENGTH_X)
-    y_px = int(dy_m * FOCAL_LENGTH_Y)
     data = {
-        'x': int(x_px),
-        'y': int(y_px),
+        'x': int(dx_m),
+        'y': int(dy_m),
         'angle': float(angle)
     }
     temp_file = 'offsets_tmp.json'
@@ -274,7 +270,7 @@ def main():
         logging.error("❌ Не удалось получить первый кадр.")
         return 1
 
-    SHOW_DISPLAY = True
+    SHOW_DISPLAY = False
     if SHOW_DISPLAY:
         cv2.namedWindow("Rope Ladder Tracker", cv2.WINDOW_NORMAL)
 
@@ -299,8 +295,8 @@ def main():
     )
 
     tracking_active = False
-    dx_px = None
-    dy_px = None
+    dx_px = 0
+    dy_px = 0
 
     fps = 0.0
     frame_count = 0
@@ -326,7 +322,7 @@ def main():
                     logging.info("🔴 Трекинг остановлен. Сброс waypoints.")
                     waypoints.clear()
                     anchor_center_fixed = None
-                    save_offset(0, 0)
+                    save_offset(dx_px, dy_px)
                     tracking_active = False
                 time.sleep(FRAME_INTERVAL)
                 continue
@@ -351,7 +347,7 @@ def main():
                         last_ladder_update_time = time.time()
                     else:
                         logging.warning("⚠️ Нет точек для старта — пропуск кадра")
-                        save_offset(0, 0)
+                        save_offset(dx_px, dx_py)
                         time.sleep(FRAME_INTERVAL)
                         continue
 
@@ -361,14 +357,14 @@ def main():
                 new_points, status, _ = cv2.calcOpticalFlowPyrLK(waypoints[-1]['gray'], gray, np.array(waypoints[-1]['points']).reshape(-1, 1, 2).astype(np.float32), None, **lk_params)
                 
                 if new_points is None or status is None:
-                     save_offset(0, 0)
+                     save_offset(dx_px, dx_py)
                      logging.warning("⚠️ Ошибка Optical Flow — сохраняем (0, 0)")
                      prev_gray = gray
                      continue
 
                 good_indices = [i for i, s in enumerate(status.flatten()) if s == 1]
                 if len(good_indices) == 0:
-                     save_offset(0, 0)
+                     save_offset(dx_px, dy_px)
                      logging.warning("⚠️ Все точки потеряны — сохраняем (0, 0)")
                      prev_gray = gray
                      continue
@@ -379,7 +375,7 @@ def main():
                 prev_gray = gray
 
                 if tracked_points is None or len(tracked_points) == 0:
-                    save_offset(0, 0)
+                    save_offset(dx_px, dx_py)
                     logging.warning("⚠️ Нет точек после Optical Flow — сохраняем (0, 0)")
                     time.sleep(FRAME_INTERVAL)
                     continue
@@ -405,11 +401,11 @@ def main():
 
                 # --- Расчет и сохранение смещения ---
                 # Используем СГЛАЖЕННУЮ позицию без коррекции на угол
-                start_center = anchor_center_fixed if anchor_center_fixed is not None else waypoints[0]['center']
-                dx_px = smoothed_curr_center[0] - start_center[0]
-                dy_px = smoothed_curr_center[1] - start_center[1]
+                last_waypoint_center = waypoints[-1]['center']
+                dx_px = smoothed_curr_center[0] - last_waypoint_center[0]
+                dy_px = smoothed_curr_center[1] - last_waypoint_center[1]
                 # Передаем угол отдельно
-                save_offset(dx_px / FOCAL_LENGTH_X, dy_px / FOCAL_LENGTH_Y, angle=np.degrees(current_angle_rad))
+                save_offset(dx_px, dy_px, angle=np.degrees(current_angle_rad))
 
                 # --- Отображение (если нужно) ---
                 if SHOW_DISPLAY:
@@ -444,8 +440,8 @@ def main():
 
                     # --- 4. Информация ---
                     if dx_px is not None and dy_px is not None:
-                        cv2.putText(display_frame, f"dx: {dx_px:>+5.0f}px", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(display_frame, f"dy: {dy_px:>+5.0f}px", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_frame, f"dx: {dx_px}px", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_frame, f"dy: {dy_px}px", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     cv2.putText(display_frame, f"WPs: {len(waypoints)}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -459,9 +455,7 @@ def main():
                 if elapsed >= 1.0:
                     fps = frame_count / elapsed
                     if len(waypoints) > 0:
-                        dx_m = (dx_px / FOCAL_LENGTH_X) if dx_px is not None else 0
-                        dy_m = (dy_px / FOCAL_LENGTH_Y) if dy_px is not None else 0
-                        logging.info(f"📊 {fps:.1f} FPS | dx={dx_m*1000:>+5.0f} | dy={dy_m*1000:>+5.0f} | WPs={len(waypoints)}")
+                        logging.info(f"📊 {fps:.1f} FPS | dx={dx_px} | dy={dy_px} | WPs={len(waypoints)}")
                     else:
                         logging.info(f"📊 {fps:.1f} FPS | dx=    0 | dy=    0 | WPs={len(waypoints)}")
                     frame_count = 0
