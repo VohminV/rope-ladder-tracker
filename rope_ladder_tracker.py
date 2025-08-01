@@ -29,6 +29,7 @@ BACKTRACK_MARGIN = 15.0
 HYSTERESIS_MARGIN = 10.0
 LADDER_UPDATE_INTERVAL = 0.5
 SMOOTHING_FACTOR = 0.7
+FLAG_PATH = 'tracking_enabled.flag'
 
 # --- Логирование ---
 logging.basicConfig(
@@ -42,7 +43,6 @@ logging.basicConfig(
 )
 
 # --- Функции ---
-
 def save_offset(dx_m, dy_m, angle=0.0):
     """Сохраняет смещение в JSON файл"""
     x_px = int(dx_m * FOCAL_LENGTH_X)
@@ -63,7 +63,11 @@ def save_offset(dx_m, dy_m, angle=0.0):
 
 def is_tracking_enabled():
     """Проверяет, активен ли трекинг (например, через внешний файл или сигнал)"""
-    return True
+    try:
+        with open(FLAG_PATH, 'r') as f:
+            return f.read().strip() == '1'
+    except:
+        return False
 
 def adaptive_good_features(gray, min_features=20, max_features=1000):
     """Адаптивное обнаружение хороших точек с улучшенной стабильностью."""
