@@ -23,12 +23,13 @@ TARGET_FPS = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 # --- Параметры трекинга и лестницы ---
-MIN_FEATURES = 20 # Уменьшено для большей гибкости (x,y -> 10 точек)
-DISTANCE_THRESHOLD = 25.0 # порог добавления новой точки (пиксели) - увеличено
-BACKTRACK_MARGIN = 15.0   # минимальное "продвижение" назад - увеличено
-HYSTERESIS_MARGIN = 10.0  # "мертвая зона" - увеличено
-LADDER_UPDATE_INTERVAL = 0.5 # Интервал обновления логики лестницы (секунды)
-FLAG_PATH = 'tracking_enabled.flag'
+MIN_FEATURES = 20
+DISTANCE_THRESHOLD = 25.0
+BACKTRACK_MARGIN = 15.0
+HYSTERESIS_MARGIN = 10.0
+LADDER_UPDATE_INTERVAL = 0.5
+SMOOTHING_FACTOR = 0.7
+
 # --- Логирование ---
 logging.basicConfig(
     level=logging.INFO,
@@ -58,93 +59,116 @@ def save_offset(dx_m, dy_m, angle=0.0):
             json.dump(data, f, indent=2)
         os.replace(temp_file, final_file)
     except Exception as e:
-        logging.warning(f"Не удалось сохранить offset: {e}")
+        logging.warning(f"❌ Не удалось сохранить offset: {e}")
 
 def is_tracking_enabled():
-    try:
-        with open(FLAG_PATH, 'r') as f:
-            return f.read().strip() == '1'
-    except:
-        return False
+    """Проверяет, активен ли трекинг (например, через внешний файл или сигнал)"""
+    return True
 
 def adaptive_good_features(gray, min_features=20, max_features=1000):
-    """Адаптивное обнаружение хороших точек"""
-    # Apply CLAHE for contrast enhancement in low-light conditions
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16,16))
+    """Адаптивное обнаружение хороших точек с улучшенной стабильностью."""
+    # 1. Улучшение контраста с CLAHE
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
     enhanced = clahe.apply(gray)
 
-    # Calculate adaptive parameters based on image characteristics
-    mean_val, std_val = cv2.meanStdDev(enhanced) # Используем enhanced вместо gray
+    # 2. Дополнительная фильтрация для уменьшения шума
+    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+    # 3. Расчет статистики для адаптивных параметров
+    mean_val, std_val = cv2.meanStdDev(blurred)
     std_scalar = std_val[0,0]
 
-    # Adaptive quality level based on image contrast
+    # 4. Адаптивный уровень качества
     quality_level = max(0.01, 0.1 * (1 - std_scalar / 50))
 
     height, width = gray.shape
     area = height * width
 
-    # Adaptive feature count based on image area
+    # 5. Адаптивное количество точек
     num_features = max(min_features, min(max_features, int(area / 500)))
+
+    # 6. Минимальное расстояние между точками
     min_distance = max(5, int(np.sqrt(area / num_features)))
 
-    # Detect features with enhanced image
+    # 7. Использование детектора Харриса
     pts = cv2.goodFeaturesToTrack(
-        image=enhanced, # Явно указываем параметр
+        image=blurred,
         maxCorners=num_features,
         qualityLevel=quality_level,
         minDistance=min_distance,
-        blockSize=7
+        blockSize=7,
+        useHarrisDetector=True,
+        k=0.04
     )
+
+    # 8. Фолбэк на более простой детектор
+    if pts is None or len(pts) < min_features:
+        logging.debug(f"[adaptive_good_features] Harris failed, falling back. Found {len(pts) if pts is not None else 0} points.")
+        pts = cv2.goodFeaturesToTrack(
+            image=blurred,
+            maxCorners=num_features,
+            qualityLevel=0.01,
+            minDistance=min_distance,
+            blockSize=5,
+            useHarrisDetector=False
+        )
+
+    # 9. Фолбэк на минимальное количество точек
+    if pts is None or len(pts) < min_features:
+        logging.warning(f"[adaptive_good_features] Not enough points even after fallback: {len(pts) if pts is not None else 0}")
+        pts = cv2.goodFeaturesToTrack(
+            image=blurred,
+            maxCorners=min_features,
+            qualityLevel=0.01,
+            minDistance=3,
+            blockSize=3
+        )
+
     if pts is not None:
-        # Преобразуем в плоский список [x1, y1, x2, y2, ...]
         return pts.reshape(-1).tolist()
     return None
 
-def add_waypoint(waypoints, points, angle=None, frame_idx=None):
-    """Добавляет новую точку на лестнице"""
+def add_waypoint(waypoints, points, angle=None, frame_idx=None, gray=None):
+    """Добавляет новую точку на лестнице и обновляет список точек для отслеживания"""
     logging.debug(f"[add_waypoint] Вызов: len(points)={len(points) if points is not None else 'None'}, MIN_FEATURES={MIN_FEATURES}")
     if points is None or len(points) < MIN_FEATURES * 2: # *2 потому что [x,y,x,y...]
         logging.debug(f"[add_waypoint] Не добавлена: недостаточно точек.")
         return
+    
+    # Обновляем список точек, которые будут использоваться для отслеживания
+    global tracked_points
+    if points is not None and len(points) >= MIN_FEATURES * 2:
+        tracked_points = points.copy()
+        logging.debug(f"[add_waypoint] Точки для отслеживания обновлены. Количество: {len(tracked_points)//2}")
+
     wp = {
         'frame': frame_idx,
         'points': np.array(points, copy=True),
         'angle': angle,
-        'center': np.mean(np.array(points).reshape(-1, 2), axis=0)
+        'center': np.mean(np.array(points).reshape(-1, 2), axis=0),
+        'gray': gray
     }
     waypoints.append(wp)
     logging.debug(f"[add_waypoint] Точка добавлена. Новый размер waypoints: {len(waypoints)}")
 
-
-def rope_ladder_waypoint_management(waypoints, current_points, current_angle=None, distance_threshold=DISTANCE_THRESHOLD, anchor_center_fixed=None):
+def rope_ladder_waypoint_management(waypoints, current_points, current_angle=None, distance_threshold=None, anchor_center_fixed=None, frame=None):
     """
     Управление точками по принципу верёвочной лестницы.
     """
-    # 1. Проверка на пустой список путевых точек
     if len(waypoints) == 0:
-        logging.debug("[RLM] Список waypoints пуст, выход.")
         return waypoints
 
-    # 2. Вычисление текущего центра и расстояния до стартовой точки (якоря)
     try:
         curr_center = np.mean(np.array(current_points).reshape(-1, 2), axis=0)
     except (ValueError, TypeError) as e:
         logging.warning(f"[RLM] Ошибка вычисления curr_center: {e}")
         return waypoints
 
-    # Используем фиксированный якорь, если он передан и валиден
-    anchor_center = None
-    if anchor_center_fixed is not None and isinstance(anchor_center_fixed, np.ndarray) and anchor_center_fixed.shape == (2,):
-        anchor_center = anchor_center_fixed
-        logging.debug(f"[RLM] Используется ФИКСИРОВАННЫЙ anchor_center: ({anchor_center[0]:.2f}, {anchor_center[1]:.2f})")
-    else:
-        # fallback к waypoints[0], но логируем предупреждение
-        anchor_center = waypoints[0]['center']
-        logging.debug(f"[RLM] Используется waypoints[0] как anchor_center: ({anchor_center[0]:.2f}, {anchor_center[1]:.2f})")
-
+    # Используем anchor_center_fixed, если он передан
+    anchor_center = anchor_center_fixed if anchor_center_fixed is not None else waypoints[0]['center']
     current_to_anchor_dist = np.linalg.norm(curr_center - anchor_center)
 
-    # 3. Поиск ближайшей существующей точки
+    # Поиск ближайшей существующей точки
     closest_dist = float('inf')
     closest_idx = -1
     for i, wp in enumerate(waypoints):
@@ -153,92 +177,93 @@ def rope_ladder_waypoint_management(waypoints, current_points, current_angle=Non
             closest_dist = dist
             closest_idx = i
 
-    # === Подробное логирование текущего состояния ===
-    logging.debug(
-        f"[RLM] --- Состояние --- len(waypoints)={len(waypoints)}, "
-        f"curr_center=({curr_center[0]:.2f}, {curr_center[1]:.2f}), "
-        f"closest_dist={closest_dist:.2f}, closest_idx={closest_idx}, "
-        f"current_to_anchor_dist={current_to_anchor_dist:.2f}, "
-        f"distance_threshold={distance_threshold}"
-    )
-
     # === ✅ Логика добавления новой точки ===
-    # Условие 1: Достаточно далеко от ЛЮБОЙ существующей точки
     if closest_dist > distance_threshold:
-        logging.debug(f"[RLM] Условие 1 выполнено: closest_dist ({closest_dist:.2f}) > distance_threshold ({distance_threshold})")
-
         if len(waypoints) == 1:
-            # 4a. Первое движение от стартовой точки
-            logging.debug(f"[RLM] len(waypoints) == 1")
-            # last_to_anchor = 0.0 (расстояние от старта до старта)
-            # Условие 2a: Достаточно далеко от стартовой точки (якоря)
-            logging.debug(f"[RLM] Проверка условия 2a: current_to_anchor_dist ({current_to_anchor_dist:.2f}) > BACKTRACK_MARGIN ({BACKTRACK_MARGIN}) ?")
+            # Первое удаление от стартовой точки
+            last_to_anchor = 0.0
             if current_to_anchor_dist > BACKTRACK_MARGIN:
-                logging.debug(f"[RLM] Условие 2a выполнено.")
-                add_waypoint(waypoints, current_points, current_angle, None)
+                add_waypoint(waypoints, current_points, current_angle, None, frame)
                 logging.info(f"➕ Добавлена точка 1 (первое движение от старта)")
-                logging.debug(f"[RLM] После добавления точки 1: len(waypoints)={len(waypoints)}")
-            else:
-                logging.debug(f"[RLM] Условие 2a НЕ выполнено.")
-
         else:
-            # 4b. Последующие движения (уже есть минимум 2 точки)
-            logging.debug(f"[RLM] len(waypoints) > 1")
-            last_center = waypoints[-1]['center'] # Центр последней добавленной точки
-
-            # Используем anchor_center (который теперь фиксирован или нет) для расчета last_to_anchor
-            last_to_anchor = np.linalg.norm(last_center - anchor_center) # Расст. от последней точки до старта
-            logging.debug(
-                f"[RLM] last_center=({last_center[0]:.2f}, {last_center[1]:.2f}), "
-                f"last_to_anchor (от якоря)={last_to_anchor:.2f}"
-            )
-            # Условие 2b: Текущая позиция значительно дальше от старта, чем последняя точка
-            condition_2b = current_to_anchor_dist > last_to_anchor + BACKTRACK_MARGIN
-            logging.debug(
-                f"[RLM] Проверка условия 2b: current_to_anchor_dist ({current_to_anchor_dist:.2f}) "
-                f"> (last_to_anchor + BACKTRACK_MARGIN) ({last_to_anchor + BACKTRACK_MARGIN:.2f}) ? "
-                f"-> {condition_2b}"
-            )
-            if condition_2b:
-                logging.debug(f"[RLM] Условие 2b выполнено.")
-                add_waypoint(waypoints, current_points, current_angle, None)
+            # Уже есть хотя бы 2 точки
+            last_center = waypoints[-1]['center']
+            last_to_anchor = np.linalg.norm(last_center - anchor_center)
+            if current_to_anchor_dist > last_to_anchor + BACKTRACK_MARGIN:
+                add_waypoint(waypoints, current_points, current_angle, None, frame)
                 logging.info(f"➕ Добавлена новая точка (удаление от старта)")
-                logging.debug(f"[RLM] После добавления новой точки: len(waypoints)={len(waypoints)}")
-            else:
-                logging.debug(f"[RLM] Условие 2b НЕ выполнено.")
 
     # === 🔙 Логика возврата (с гистерезисом) ===
-    # Условие 3: Есть к какой точке возвращаться (не к стартовой)
-    # Условие 4: Достаточно близко к этой точке (с учетом гистерезиса)
     elif closest_idx > 0 and closest_dist < (distance_threshold - HYSTERESIS_MARGIN):
-        logging.debug(f"[RLM] Условие возврата выполнено: closest_idx ({closest_idx}) > 0 И closest_dist ({closest_dist:.2f}) < (D-H) ({distance_threshold - HYSTERESIS_MARGIN})")
-        # 5. Возврат: удаляем все точки после ближайшей
-        waypoints[:] = waypoints[:closest_idx + 1] # Обрезаем список на месте
-        logging.info(f"Возврат к точке {closest_idx}. Удалены последующие.")
-        logging.debug(f"[RLM] После возврата: len(waypoints) теперь {len(waypoints)}")
-    else:
-        logging.debug(f"[RLM] Ничего не делаем.")
+        waypoints[:] = waypoints[:closest_idx + 1]
+        # Обновляем отслеживаемые точки на точки из последней оставшейся WP
+        if len(waypoints) > 0:
+            global tracked_points
+            tracked_points = waypoints[-1]['points'].tolist().copy()
+        logging.info(f"🔙 Возврат к точке {closest_idx}. Удалены последующие.")
 
     return waypoints
 
+def calculate_angle(prev_points, curr_points):
+    """
+    Расчет угла поворота между двумя наборами точек.
+    Использует все точки для повышения точности.
+    Возвращает угол в радианах.
+    """
+    if len(prev_points) < 4 or len(curr_points) < 4:
+        return 0.0
+
+    try:
+        prev_pts = np.array(prev_points).reshape(-1, 2)
+        curr_pts = np.array(curr_points).reshape(-1, 2)
+    except:
+        return 0.0
+
+    num_points = min(len(prev_pts), len(curr_pts))
+    if num_points < 2:
+        return 0.0
+
+    prev_pts = prev_pts[:num_points]
+    curr_pts = curr_pts[:num_points]
+
+    prev_center = np.mean(prev_pts, axis=0)
+    curr_center = np.mean(curr_pts, axis=0)
+
+    prev_centered = prev_pts - prev_center
+    curr_centered = curr_pts - curr_center
+
+    H = np.dot(prev_centered.T, curr_centered)
+
+    U, S, Vt = np.linalg.svd(H)
+
+    R = np.dot(Vt.T, U.T)
+
+    if np.linalg.det(R) < 0:
+        Vt[-1,:] *= -1
+        R = np.dot(Vt.T, U.T)
+
+    cos_angle = R[0, 0]
+    sin_angle = R[1, 0]
+    angle_rad = np.arctan2(sin_angle, cos_angle)
+
+    return angle_rad
 
 def main():
     """Основная функция"""
-    logging.info("Rope Ladder Tracker: возврат через структурированную историю")
+    logging.info("🚀 Rope Ladder Tracker: возврат через структурированную историю")
 
-    # --- Инициализация камеры ---
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH_PX)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT_PX)
     cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
     if not cap.isOpened():
-        logging.error("Не удалось открыть камеру.")
+        logging.error("❌ Не удалось открыть камеру.")
         return 1
 
     ret, frame = cap.read()
     if not ret or frame is None:
-        logging.error("Не удалось получить первый кадр.")
+        logging.error("❌ Не удалось получить первый кадр.")
         return 1
 
     SHOW_DISPLAY = True
@@ -247,25 +272,24 @@ def main():
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     tracked_points = adaptive_good_features(gray)
-    if tracked_points is None or len(tracked_points) < MIN_FEATURES * 2: # *2 для [x,y]
-        logging.error("Недостаточно точек при старте.")
+    if tracked_points is None or len(tracked_points) < MIN_FEATURES * 2:
+        logging.error("❌ Недостаточно точек при старте.")
         return 1
 
     prev_gray = gray.copy()
+    prev_tracked_points = tracked_points.copy()
     frame_idx = 0
 
-    # === 🪜 Верёвочная лестница ===
     waypoints = []
-    anchor_center_fixed = None # Новый: фиксированный якорь
+    anchor_center_fixed = None
+    smoothed_curr_center = None
 
-    # === ⚙️ Параметры LK ===
     lk_params = dict(
         winSize=(21, 21),
         maxLevel=3,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
     )
 
-    # === 🔁 Состояние трекинга ===
     tracking_active = False
     dx_px = None
     dy_px = None
@@ -273,149 +297,149 @@ def main():
     fps = 0.0
     frame_count = 0
     start_time = time.time()
-
-    # === 🕒 Таймер для верёвочной лестницы ===
     last_ladder_update_time = 0.0
 
     try:
         while True:
             loop_start = time.time()
 
-            # - Захват кадра -
             ret, frame = cap.read()
             if not ret or frame is None:
-                logging.warning("Пустой кадр — пропуск")
+                logging.warning("⚠️ Пустой кадр — пропуск")
                 time.sleep(FRAME_INTERVAL)
                 continue
 
             frame_idx += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # - Проверка включения трекинга -
             tracking_now = is_tracking_enabled()
             if not tracking_now:
                 if tracking_active:
-                    logging.info("Трекинг остановлен. Сброс waypoints.")
+                    logging.info("🔴 Трекинг остановлен. Сброс waypoints.")
                     waypoints.clear()
-                    anchor_center_fixed = None # Сброс фиксированного якоря
+                    anchor_center_fixed = None
                     save_offset(0, 0)
                     tracking_active = False
-                # prev_gray = gray # 🔁 Обновляем для стабильности - не обновляем, если не активен
                 time.sleep(FRAME_INTERVAL)
                 continue
             else:
                 if not tracking_active:
-                    logging.info("Трекинг включён. Устанавливаем новый старт.")
-                    # Перезапускаем с текущего кадра
+                    logging.info("🟢 Трекинг включён. Устанавливаем новый старт.")
                     fresh_points = adaptive_good_features(gray)
-                    if fresh_points is not None and len(fresh_points) >= MIN_FEATURES * 2: # *2 для [x,y]
+                    if fresh_points is not None and len(fresh_points) >= MIN_FEATURES * 2:
                         waypoints.clear()
-                        anchor_center_fixed = None # Сброс перед новым стартом
+                        anchor_center_fixed = None
+                        smoothed_curr_center = None
 
-                        add_waypoint(waypoints, fresh_points, frame_idx=0)
-                        # Инициализируем фиксированный якорь после добавления первой точки
+                        add_waypoint(waypoints, fresh_points, frame_idx=0, gray=gray)
                         if waypoints:
                              anchor_center_fixed = waypoints[0]['center'].copy()
-                             logging.info(f"Фиксированный старт установлен: ({anchor_center_fixed[0]:.2f}, {anchor_center_fixed[1]:.2f})")
+                             logging.info(f"📍 Фиксированный старт установлен: ({anchor_center_fixed[0]:.2f}, {anchor_center_fixed[1]:.2f})")
 
-                        tracked_points = fresh_points.copy() # ✅ Синхронизация
-                        logging.info("Новый старт установлен.")
-                        prev_gray = gray.copy() # Обновляем prev_gray только при новом старте
-                        last_ladder_update_time = time.time() # Сброс таймера при новом старте
+                        tracked_points = fresh_points.copy()
+                        prev_tracked_points = fresh_points.copy()
+                        logging.info("🔄 Новый старт установлен.")
+                        prev_gray = gray.copy()
+                        last_ladder_update_time = time.time()
                     else:
-                        logging.warning("Нет точек для старта — пропуск кадра")
+                        logging.warning("⚠️ Нет точек для старта — пропуск кадра")
                         save_offset(0, 0)
-                        # prev_gray = gray # Не обновляем, если старт не удался
                         time.sleep(FRAME_INTERVAL)
                         continue
 
                     tracking_active = True
-                    # Продолжаем выполнение ниже для обработки этого кадра
 
-            # - Отслеживание -
-            if tracking_active and tracked_points is not None and len(tracked_points) > 0:
-                new_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, np.array(tracked_points).reshape(-1, 1, 2).astype(np.float32), None, **lk_params)
+            if tracking_active and waypoints[-1]['points'] is not None and len(waypoints[-1]['points']) > 0:
+                new_points, status, _ = cv2.calcOpticalFlowPyrLK(waypoints[-1]['gray'], gray, np.array(waypoints[-1]['points']).reshape(-1, 1, 2).astype(np.float32), None, **lk_params)
                 
                 if new_points is None or status is None:
-                     # Ошибка LK, сохраняем 0 и продолжаем
                      save_offset(0, 0)
-                     logging.warning("Ошибка Optical Flow — сохраняем (0, 0)")
-                     prev_gray = gray # Обновляем для следующего кадра
-                     time.sleep(FRAME_INTERVAL)
+                     logging.warning("⚠️ Ошибка Optical Flow — сохраняем (0, 0)")
+                     prev_gray = gray
                      continue
 
                 good_indices = [i for i, s in enumerate(status.flatten()) if s == 1]
                 if len(good_indices) == 0:
-                     # Все точки потеряны, сохраняем 0 и продолжаем
                      save_offset(0, 0)
-                     logging.warning("Все точки потеряны — сохраняем (0, 0)")
+                     logging.warning("⚠️ Все точки потеряны — сохраняем (0, 0)")
                      prev_gray = gray
-                     time.sleep(FRAME_INTERVAL)
                      continue
 
-                tracked_points = new_points[good_indices].reshape(-1).tolist()
-                prev_gray = gray # ✅ Всегда обновляем
+                new_tracked_points = new_points[good_indices].reshape(-1).tolist()
+                prev_tracked_points = tracked_points
+                tracked_points = new_tracked_points
+                prev_gray = gray
 
-                # === 🔒 Защита от пустых точек ===
                 if tracked_points is None or len(tracked_points) == 0:
                     save_offset(0, 0)
-                    logging.warning("Нет точек после Optical Flow — сохраняем (0, 0)")
+                    logging.warning("⚠️ Нет точек после Optical Flow — сохраняем (0, 0)")
                     time.sleep(FRAME_INTERVAL)
                     continue
+
+                # === 🔄 Сглаживание текущего центра ===
+                current_center_raw = np.mean(np.array(tracked_points).reshape(-1, 2), axis=0)
+                if smoothed_curr_center is None:
+                    smoothed_curr_center = current_center_raw.copy()
+                else:
+                    smoothed_curr_center = SMOOTHING_FACTOR * current_center_raw + (1 - SMOOTHING_FACTOR) * smoothed_curr_center
+
+                # === 🔄 Расчет угла поворота ===
+                current_angle_rad = calculate_angle(prev_tracked_points, tracked_points)
 
                 # === 🪜 Управление "лестницей" (с ограничением по времени) ===
                 current_time = time.time()
                 ladder_updated = False
                 if current_time - last_ladder_update_time >= LADDER_UPDATE_INTERVAL:
                     if len(waypoints) > 0:
-                        # Передаем фиксированный якорь
-                        rope_ladder_waypoint_management(waypoints, tracked_points, current_angle=None, anchor_center_fixed=anchor_center_fixed)
-                        # Обновляем время последнего обновления
+                        rope_ladder_waypoint_management(waypoints, tracked_points, current_angle=None,  distance_threshold=DISTANCE_THRESHOLD, anchor_center_fixed=anchor_center_fixed, frame=gray)
                         last_ladder_update_time = current_time
                         ladder_updated = True
 
                 # --- Расчет и сохранение смещения ---
-                # ВАЖНО: Расчет смещения выполняется на КАЖДОМ кадре, независимо от таймера лестницы
-                if len(waypoints) > 0 and tracked_points is not None and len(tracked_points) > 0:
-                    try:
-                        current_center = np.mean(np.array(tracked_points).reshape(-1, 2), axis=0)
-                        start_center = anchor_center_fixed if anchor_center_fixed is not None else waypoints[0]['center']
-                        dx_px = current_center[0] - start_center[0]
-                        dy_px = current_center[1] - start_center[1]
-                        save_offset(dx_px / FOCAL_LENGTH_X, dy_px / FOCAL_LENGTH_Y)
-                    except Exception as e:
-                        logging.warning(f"Ошибка расчета смещения: {e}")
-                        save_offset(0, 0)
-                        dx_px, dy_px = 0, 0
-                else:
-                    dx_px, dy_px = 0, 0
-                    save_offset(0, 0)
+                # Используем СГЛАЖЕННУЮ позицию без коррекции на угол
+                start_center = anchor_center_fixed if anchor_center_fixed is not None else waypoints[0]['center']
+                dx_px = smoothed_curr_center[0] - start_center[0]
+                dy_px = smoothed_curr_center[1] - start_center[1]
+                # Передаем угол отдельно
+                save_offset(dx_px / FOCAL_LENGTH_X, dy_px / FOCAL_LENGTH_Y, angle=np.degrees(current_angle_rad))
 
                 # --- Отображение (если нужно) ---
                 if SHOW_DISPLAY:
                     display_frame = frame.copy()
-                    # Рисуем точки
+
+                    # --- 1. Рисуем ТЕКУЩИЕ отслеживаемые точки (зеленые) ---
                     if tracked_points:
                         for i in range(0, len(tracked_points), 2):
                             x, y = int(tracked_points[i]), int(tracked_points[i+1])
-                            cv2.circle(display_frame, (x, y), 3, (0, 255, 0), -1)
+                            cv2.circle(display_frame, (x, y), 3, (0, 255, 0), -1) # Зеленый
+                        cv2.putText(display_frame, f"Tracked: {len(tracked_points)//2}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-                    # Рисуем waypoints
+                    # --- 2. Рисуем ТОЧКИ ИЗ СТАРТОВОЙ ПУТЕВОЙ ТОЧКИ (Синие) ---
+                    if len(waypoints) > 0 and anchor_center_fixed is not None:
+                        start_wp_points = waypoints[0]['points']
+                        # Преобразуем в массив numpy
+                        start_pts = start_wp_points.reshape(-1, 2)
+                        # Отрисовываем все точки из стартовой WP
+                        for pt in start_pts:
+                            x, y = int(pt[0]), int(pt[1])
+                            # Проверяем, в пределах ли кадра
+                            if 0 <= x < IMAGE_WIDTH_PX and 0 <= y < IMAGE_HEIGHT_PX:
+                                cv2.circle(display_frame, (x, y), 3, (255, 0, 0), -1) # Синий
+                        cv2.putText(display_frame, f"Anchored: {len(start_pts)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
+                    # --- 3. Рисуем ПУТЕВЫЕ ТОЧКИ (Красные и синие) ---
                     for i, wp in enumerate(waypoints):
                         cx, cy = int(wp['center'][0]), int(wp['center'][1])
                         color = (255, 0, 0) if i == 0 else (0, 0, 255)
                         cv2.circle(display_frame, (cx, cy), 5, color, -1)
                         cv2.putText(display_frame, f'WP{i}', (cx+5, cy+5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-                    # Инфо
+                    # --- 4. Информация ---
                     if dx_px is not None and dy_px is not None:
-                        cv2.putText(display_frame, f"dx: {dx_px:>+5.0f}px", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(display_frame, f"dy: {dy_px:>+5.0f}px", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.putText(display_frame, f"WPs: {len(waypoints)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    # Индикатор обновления лестницы
-                    if ladder_updated:
-                        cv2.putText(display_frame, "RLM Updated", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                        cv2.putText(display_frame, f"dx: {dx_px:>+5.0f}px", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_frame, f"dy: {dy_px:>+5.0f}px", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(display_frame, f"WPs: {len(waypoints)}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
                     cv2.imshow("Rope Ladder Tracker", display_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -429,34 +453,32 @@ def main():
                     if len(waypoints) > 0:
                         dx_m = (dx_px / FOCAL_LENGTH_X) if dx_px is not None else 0
                         dy_m = (dy_px / FOCAL_LENGTH_Y) if dy_px is not None else 0
-                        logging.info(f"{fps:.1f} FPS | dx={dx_m*1000:>+5.0f} | dy={dy_m*1000:>+5.0f} | WPs={len(waypoints)}")
+                        logging.info(f"📊 {fps:.1f} FPS | dx={dx_m*1000:>+5.0f} | dy={dy_m*1000:>+5.0f} | WPs={len(waypoints)}")
                     else:
-                        logging.info(f"{fps:.1f} FPS | dx=    0 | dy=    0 | WPs={len(waypoints)}")
+                        logging.info(f"📊 {fps:.1f} FPS | dx=    0 | dy=    0 | WPs={len(waypoints)}")
                     frame_count = 0
                     start_time = time.time()
 
             else:
-                # Трекинг не активен или нет точек
                 save_offset(0, 0)
                 if SHOW_DISPLAY:
                      cv2.imshow("Rope Ladder Tracker", frame)
                      if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
 
-            # --- Интервал кадров ---
             loop_time = time.time() - loop_start
             if loop_time < FRAME_INTERVAL:
                 time.sleep(FRAME_INTERVAL - loop_time)
 
     except KeyboardInterrupt:
-        logging.info("Остановлено пользователем.")
+        logging.info("🛑 Остановлено пользователем.")
     except Exception as e:
-        logging.error(f"Ошибка: {e}", exc_info=True)
+        logging.error(f"💥 Ошибка: {e}", exc_info=True)
     finally:
         cap.release()
         if SHOW_DISPLAY:
             cv2.destroyAllWindows()
-        logging.info("Система завершена.")
+        logging.info("👋 Система завершена.")
     return 0
 
 if __name__ == "__main__":
