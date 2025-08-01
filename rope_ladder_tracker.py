@@ -196,10 +196,14 @@ def rope_ladder_waypoint_management(waypoints, current_points, current_angle=Non
     # === 🔙 Логика возврата (с гистерезисом) ===
     elif closest_idx > 0 and closest_dist < (distance_threshold - HYSTERESIS_MARGIN):
         waypoints[:] = waypoints[:closest_idx + 1]
-        # Обновляем отслеживаемые точки на точки из последней оставшейся WP
-        if len(waypoints) > 0:
-            global tracked_points
-            tracked_points = waypoints[-1]['points'].tolist().copy()
+        # Ключевое изменение: Обновляем отслеживаемые точки НА ТЕКУЩЕМ кадре
+        # А не из старых данных waypoints
+        fresh_points = adaptive_good_features(frame) # <--- Используем текущий кадр
+        if fresh_points is not None and len(fresh_points) >= MIN_FEATURES * 2:
+            tracked_points = fresh_points.copy()
+            logging.info(f"🔄 Трекинг восстановлен после возврата. Найдено {len(tracked_points)//2} точек.")
+        else:
+            logging.warning("⚠️ Не удалось найти новые точки после возврата.")
         logging.info(f"🔙 Возврат к точке {closest_idx}. Удалены последующие.")
 
     return waypoints
