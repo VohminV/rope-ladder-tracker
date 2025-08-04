@@ -79,7 +79,7 @@ def adaptive_good_features(gray, min_features=20, max_features=1000):
     std_scalar = std_val[0,0]
 
     # 4. Адаптивный уровень качества
-    quality_level = max(0.01, 0.1 * (1 - std_scalar / 50))
+    #quality_level = max(0.01, 0.1 * (1 - std_scalar / 50))
 
     height, width = gray.shape
     area = height * width
@@ -88,19 +88,19 @@ def adaptive_good_features(gray, min_features=20, max_features=1000):
     num_features = max(min_features, min(max_features, int(area / 500)))
 
     # 6. Минимальное расстояние между точками
-    min_distance = max(5, int(np.sqrt(area / num_features)))
+    #min_distance = max(5, int(np.sqrt(area / num_features)))
 
     # 7. Использование детектора Харриса
     pts = cv2.goodFeaturesToTrack(
         image=blurred,
         maxCorners=num_features,
-        qualityLevel=quality_level,
-        minDistance=min_distance,
+        qualityLevel=0.03,
+        minDistance=18,
         blockSize=7,
-        useHarrisDetector=True,
-        k=0.04
+        useHarrisDetector=False#True
+        #k=0.04
     )
-
+    """
     # 8. Фолбэк на более простой детектор
     if pts is None or len(pts) < min_features:
         logging.debug(f"[adaptive_good_features] Harris failed, falling back. Found {len(pts) if pts is not None else 0} points.")
@@ -122,7 +122,7 @@ def adaptive_good_features(gray, min_features=20, max_features=1000):
             qualityLevel=0.01,
             minDistance=3,
             blockSize=3
-        )
+        )"""
 
     if pts is not None:
         return pts.reshape(-1).tolist()
@@ -290,8 +290,9 @@ def main():
 
     lk_params = dict(
         winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        maxLevel=4,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.03),
+        minEigThreshold=0.001
     )
 
     tracking_active = False
