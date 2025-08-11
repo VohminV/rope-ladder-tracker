@@ -264,6 +264,12 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + roll_ticks))
         channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + pitch_ticks))
 
+        # === КОРРЕКЦИЯ ГАЗА НА ОСНОВЕ ВЫСОТЫ ===
+        # Используем ТЕКУЩЕЕ значение channels_old[2] как базу
+        base_throttle = channels_old[2]  # ← Ключевая строка: сохраняем предыдущее значение
+        new_throttle = base_throttle + correction_ticks
+        channels_old[2] = max(MIN_TICKS, min(MAX_TICKS, new_throttle))
+
         # --- Поворот по углу (если нужен возврат по ориентации) ---
         """
         DEADZONE_ANGLE = 3
