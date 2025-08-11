@@ -208,7 +208,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     FRAME_HEIGHT = 480
     
     # Mavlink получение высоты в метрах
-    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="115200", timeout=0)
+    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="57600", timeout=0)
     
     # === Переменные для высоты ===
     target_alt = None          # Целевая высота (устанавливается при старте)
@@ -225,7 +225,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         # === Получение высоты из MAVLink ===
         msg = mav_connection.recv_match(type='ALTITUDE', blocking=False)
         if msg is not None:
-            current_alt = msg.altitude_monotonic  # в метрах
+            current_alt =  msg.relative_alt / 1000.0  # в метрах
 
             # ✅ Установка целевой высоты ТОЛЬКО ПРИ ВКЛЮЧЕНИИ
             if target_alt is None and correction_active:
@@ -269,8 +269,8 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         final_smoothed_y = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_y))
 
         # Перевод в тики
-        channels_old[0] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + avg_dx)))
-        channels_old[1] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + avg_dy)))
+        channels_old[0] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-final_smoothed_x))))
+        channels_old[1] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-final_smoothed_y))))
 
         # === КОРРЕКЦИЯ ГАЗА НА ОСНОВЕ ВЫСОТЫ ===
         # Используем ТЕКУЩЕЕ значение channels_old[2] как базу
