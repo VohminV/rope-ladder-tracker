@@ -16,7 +16,7 @@ import logging
 import json
 import os
 import math
-
+from collections import deque
 # ----------------- Настройки -----------------
 IMAGE_WIDTH_PX = 640
 IMAGE_HEIGHT_PX = 480
@@ -30,18 +30,22 @@ BACKTRACK_MARGIN = 25.0
 HYSTERESIS_MARGIN = 12.0
 LADDER_UPDATE_INTERVAL = 0.8
 
-INLIER_SAVE_RATIO = 0.35
-MIN_INLIER_COUNT = 10
+INLIER_SAVE_RATIO = 0.5
+MIN_INLIER_COUNT = 15
 
-FLAG_PATH = 'tracking_enabled.flag'
-OFFSETS_FILE = 'offsets.json'
+FLAG_PATH = '/home/orangepi/tracking_enabled.flag'
+OFFSETS_FILE = '/home/orangepi/offsets.json'
 ROI = None
 
 SAVE_MODE = 'last'
-DEBUG = True
+DEBUG = False
 SAVE_IN_METERS = False
 CURRENT_HEIGHT_M = None
 CAMERA_FOV_DEG = 70.0
+
+# Буфер для хранения последних смещений (dx, dy)
+OFFSET_BUFFER_SIZE = 20
+offset_buffer = deque(maxlen=OFFSET_BUFFER_SIZE)
 
 # Логирование
 logging.basicConfig(
@@ -65,7 +69,7 @@ def px_to_m(dx_px, dy_px, height_m, fov_deg=CAMERA_FOV_DEG, img_w=IMAGE_WIDTH_PX
 
 def save_offset(dx, dy, angle=0.0, in_meters=False):
     data = {
-        'x': float(dx), 'y': float(dy), 'angle': float(angle),
+        'x': int(dx), 'y': int(dy), 'angle': float(angle),
         'units': 'meters' if in_meters else 'pixels', 'ts': time.time()
     }
     tmp = OFFSETS_FILE + '.tmp'
@@ -298,31 +302,39 @@ def main():
                     prev_gray = gray.copy()
                     continue
                 else:
-                    save_offset(0, 0, 0)
-                    time.sleep(FRAME_INTERVAL)
+                    avg_dx = int(round(sum(x for x, y in offset_buffer) / len(offset_buffer)))
+                    avg_dy = int(round(sum(y for x, y in offset_buffer) / len(offset_buffer)))
+                    save_offset(avg_dx, avg_dy, 0.0, in_meters=False)
                     continue
 
             # Проверка inliers
             min_inliers = max(MIN_INLIER_COUNT, len(new_pts) * INLIER_SAVE_RATIO)
             if inliers < min_inliers:
                 logging.warning(f"Низкие inliers ({inliers} < {min_inliers}) -> пропуск")
-                save_offset(dx_px, dy_px, angle_deg, in_meters=SAVE_IN_METERS and CURRENT_HEIGHT_M is not None)
+                dx_px, dy_px = 0, 0
+                avg_dx, avg_dy = 0, 0
             else:
                 kalmed = kalman.correct_and_predict(smoothed_center)
                 last_center = waypoints[-1]['center']
                 offset = kalmed - last_center
                 
                 if SAVE_MODE == 'last':
-                    dx_px, dy_px = float(offset[0]), float(offset[1])
+                    dx_px, dy_px = int(offset[0]), int(offset[1])
                 else:
                     total = waypoints[-1]['cumulative'] + offset
-                    dx_px, dy_px = float(total[0]), float(total[1])
+                    dx_px, dy_px = int(total[0]), int(total[1])
+                    
+                # === СГЛАЖИВАНИЕ ЧЕРЕЗ СРЕДНЕЕ ПО 20 КАДРАМ ===
+                offset_buffer.append((dx_px, dy_px))
+
+                avg_dx = int(round(sum(x for x, y in offset_buffer) / len(offset_buffer)))
+                avg_dy = int(round(sum(y for x, y in offset_buffer) / len(offset_buffer)))
 
                 if SAVE_IN_METERS and CURRENT_HEIGHT_M is not None:
-                    dx_m, dy_m = px_to_m(dx_px, dy_px, CURRENT_HEIGHT_M)
+                    dx_m, dy_m = px_to_m(avg_dx, avg_dy, CURRENT_HEIGHT_M)
                     save_offset(dx_m, dy_m, angle_deg, in_meters=True)
                 else:
-                    save_offset(dx_px, dy_px, angle_deg, in_meters=False)
+                    save_offset(avg_dx, avg_dy, angle_deg, in_meters=False)
 
             # Обновление лестницы
             now = time.time()

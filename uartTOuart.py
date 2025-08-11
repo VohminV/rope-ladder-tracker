@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import threading
-
+from collections import deque
 # Настройка логгера
 logging.basicConfig(
     level=logging.INFO,  # Уровень логирования (можно DEBUG для более подробного вывода)
@@ -199,23 +199,26 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     # Сглаживание
     smoothed_offset_x = 0.0
     smoothed_offset_y = 0.0
-    SMOOTHING_FACTOR_OFFSET = 0.3  # 0.0 - нет реакции, 1.0 - без сглаживания
+    final_smoothed_x = 0.0
+    final_smoothed_y = 0.0
+    SMOOTHING_FACTOR_OFFSET = 0.2  # 0.0 - нет реакции, 1.0 - без сглаживания
 
     # Кадр (используем весь)
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
-
-    # Масштаб — ±400 тиков при максимальном смещении по всей ширине/высоте кадра
-    ROLL_SCALE = 400 / FRAME_WIDTH
-    PITCH_SCALE = 400 / FRAME_HEIGHT
     
     # Mavlink получение высоты в метрах
-    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="57600")
+    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="115200", timeout=0)
     
     # === Переменные для высоты ===
     target_alt = None          # Целевая высота (устанавливается при старте)
     max_correction_ticks = 100 # Максимальная коррекция ±100 тиков
     Kp = 80.0                  # Коэффициент P-регулятора (подбирается)
+
+    # Буфер для хранения последних смещений (dx, dy)
+    OFFSET_BUFFER_SIZE = 20
+    offset_buffer = deque(maxlen=OFFSET_BUFFER_SIZE)
+
 
     while not stop_event.is_set():
         
@@ -224,24 +227,24 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         if msg is not None:
             current_alt = msg.altitude_monotonic  # в метрах
 
-            # Устанавливаем целевую высоту при первом получении данных
-            if target_alt is None:
+            # ✅ Установка целевой высоты ТОЛЬКО ПРИ ВКЛЮЧЕНИИ
+            if target_alt is None and correction_active:
                 target_alt = current_alt
                 print(f"🎯 Целевая высота установлена: {target_alt:.2f} м")
 
-            # Вычисляем ошибку
-            error = target_alt - current_alt
-
-            # Пропорциональная коррекция (в тиках)
-            correction_ticks = int(error * Kp)
-            correction_ticks = max(-max_correction_ticks, min(max_correction_ticks, correction_ticks))
+                if target_alt is not None:
+                    error = target_alt - current_alt
+                    correction_ticks = int(error * Kp)
+                    correction_ticks = max(-max_correction_ticks, min(max_correction_ticks, correction_ticks))
+                else:
+                    correction_ticks = 0
         else:
             # Если нет данных — не вносим коррекцию
             correction_ticks = 0
         
         # === Чтение offsets.json (roll/pitch) ===
         try:
-            with open('offsets.json', 'r') as f:
+            with open('/home/orangepi/offsets.json', 'r') as f:
                 offsets = json.load(f)
                 new_offset_x = offsets.get('x', 0)
                 new_offset_y = offsets.get('y', 0)
@@ -251,18 +254,23 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
             new_offset_y = 0
             angle = 0
 
-        # Сглаживание смещений
-        smoothed_offset_x = (SMOOTHING_FACTOR_OFFSET * new_offset_x +
-                             (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_x)
-        smoothed_offset_y = (SMOOTHING_FACTOR_OFFSET * new_offset_y +
-                             (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_y)
+        #Первое сглаживание (от трекера)
+        smoothed_offset_x = SMOOTHING_FACTOR_OFFSET * new_offset_x + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_x
+        smoothed_offset_y = SMOOTHING_FACTOR_OFFSET * new_offset_y + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_y
 
-        # Перевод в тики с масштабированием
-        roll_ticks = int(round(smoothed_offset_x * ROLL_SCALE))
-        pitch_ticks = int(round(smoothed_offset_y * PITCH_SCALE))
+        #Второе сглаживание (для каналов)
+        alpha = 0.3  # Можно уменьшить до 0.2 для ещё большей стабильности
+        final_smoothed_x = alpha * smoothed_offset_x + (1 - alpha) * final_smoothed_x
+        final_smoothed_y = alpha * smoothed_offset_y + (1 - alpha) * final_smoothed_y
 
-        channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + roll_ticks))
-        channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + pitch_ticks))
+        #Ограничение максимального смещения (защита от выбросов)
+        MAX_ALLOWED_OFFSET = 150  # пикселей (эквивалент ~150 тиков)
+        final_smoothed_x = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_x))
+        final_smoothed_y = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_y))
+
+        # Перевод в тики
+        channels_old[0] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + avg_dx)))
+        channels_old[1] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + avg_dy)))
 
         # === КОРРЕКЦИЯ ГАЗА НА ОСНОВЕ ВЫСОТЫ ===
         # Используем ТЕКУЩЕЕ значение channels_old[2] как базу
