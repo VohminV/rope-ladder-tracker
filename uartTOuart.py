@@ -98,7 +98,7 @@ def extract_channels(data):
             channels.append(channel_value)
 
     return channels
-
+"""
 def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     import json
     import logging
@@ -163,7 +163,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + roll_ticks))
         channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + pitch_ticks))
 
-        """if angle < -5 or angle > 5: # мёртвая зона, чтобы не дёргался на шум
+        if angle < -5 or angle > 5: # мёртвая зона, чтобы не дёргался на шум
             yaw_error = angle  # компенсируем поворот (если угол > 0, надо крутить вправо)
     
             yaw_error_limited = max(-30, min(30, yaw_error))  # ограничим диапазон
@@ -174,7 +174,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     
             channels_old[3] = yaw_channel
         else:
-            channels_old[3] = CENTER_TICKS"""
+            channels_old[3] = CENTER_TICKS
     
         packed_channels = pack_channels(channels_old)
         data_without_crc_old[3:25] = packed_channels
@@ -183,6 +183,105 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         uart4.write(bytes(updated_data))
 
         #logging.info(f"HEAD: {current_heading:.1f}, ΔH={yaw_error:.1f}°")
+
+    global is_thread_running
+    is_thread_running = False
+"""
+def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
+    import json
+    import time
+    from pymavlink import mavutil
+    # CRSF параметры
+    CENTER_TICKS = 992
+    MIN_TICKS = 172
+    MAX_TICKS = 1811
+   
+    # Сглаживание
+    smoothed_offset_x = 0.0
+    smoothed_offset_y = 0.0
+    SMOOTHING_FACTOR_OFFSET = 0.3  # 0.0 - нет реакции, 1.0 - без сглаживания
+
+    # Кадр (используем весь)
+    FRAME_WIDTH = 640
+    FRAME_HEIGHT = 480
+
+    # Масштаб — ±400 тиков при максимальном смещении по всей ширине/высоте кадра
+    ROLL_SCALE = 400 / FRAME_WIDTH
+    PITCH_SCALE = 400 / FRAME_HEIGHT
+    
+    # Mavlink получение высоты в метрах
+    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="57600")
+    
+    # === Переменные для высоты ===
+    target_alt = None          # Целевая высота (устанавливается при старте)
+    max_correction_ticks = 100 # Максимальная коррекция ±100 тиков
+    Kp = 80.0                  # Коэффициент P-регулятора (подбирается)
+
+    while not stop_event.is_set():
+        
+        # === Получение высоты из MAVLink ===
+        msg = mav_connection.recv_match(type='ALTITUDE', blocking=False)
+        if msg is not None:
+            current_alt = msg.altitude_monotonic  # в метрах
+
+            # Устанавливаем целевую высоту при первом получении данных
+            if target_alt is None:
+                target_alt = current_alt
+                print(f"🎯 Целевая высота установлена: {target_alt:.2f} м")
+
+            # Вычисляем ошибку
+            error = target_alt - current_alt
+
+            # Пропорциональная коррекция (в тиках)
+            correction_ticks = int(error * Kp)
+            correction_ticks = max(-max_correction_ticks, min(max_correction_ticks, correction_ticks))
+        else:
+            # Если нет данных — не вносим коррекцию
+            correction_ticks = 0
+        
+        # === Чтение offsets.json (roll/pitch) ===
+        try:
+            with open('offsets.json', 'r') as f:
+                offsets = json.load(f)
+                new_offset_x = offsets.get('x', 0)
+                new_offset_y = offsets.get('y', 0)
+                angle = offsets.get('angle', 0)
+        except:
+            new_offset_x = 0
+            new_offset_y = 0
+            angle = 0
+
+        # Сглаживание смещений
+        smoothed_offset_x = (SMOOTHING_FACTOR_OFFSET * new_offset_x +
+                             (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_x)
+        smoothed_offset_y = (SMOOTHING_FACTOR_OFFSET * new_offset_y +
+                             (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_y)
+
+        # Перевод в тики с масштабированием
+        roll_ticks = int(round(smoothed_offset_x * ROLL_SCALE))
+        pitch_ticks = int(round(smoothed_offset_y * PITCH_SCALE))
+
+        channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + roll_ticks))
+        channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + pitch_ticks))
+
+        # --- Поворот по углу (если нужен возврат по ориентации) ---
+        """
+        DEADZONE_ANGLE = 3
+        if abs(angle) > DEADZONE_ANGLE:
+            MAX_DEFLECTION_TICKS = 400
+            yaw_error_limited = max(-30, min(30, angle))
+            yaw_normalized = yaw_error_limited / 30.0
+            yaw_ticks = int(yaw_normalized * MAX_DEFLECTION_TICKS)
+            channels_old[3] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + yaw_ticks))
+        else:
+            channels_old[3] = CENTER_TICKS
+        """
+
+        packed_channels = pack_channels(channels_old)
+        data_without_crc_old[3:25] = packed_channels
+        crc = crc8(data_without_crc_old[2:25])
+        updated_data = data_without_crc_old + [crc]
+        uart4.write(bytes(updated_data))
 
     global is_thread_running
     is_thread_running = False
