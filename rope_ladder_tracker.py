@@ -7,6 +7,7 @@
 - Устойчивый трекинг с фильтрацией вибраций
 - Продвинутая логика лесенки с анализом траектории
 - Адаптивный Kalman-фильтр
+- Центр масс точек внутри каждого waypoint
 """
 
 import cv2
@@ -17,6 +18,7 @@ import json
 import os
 import math
 from collections import deque
+
 # ----------------- Настройки -----------------
 IMAGE_WIDTH_PX = 640
 IMAGE_HEIGHT_PX = 480
@@ -33,8 +35,8 @@ LADDER_UPDATE_INTERVAL = 0.8
 INLIER_SAVE_RATIO = 0.5
 MIN_INLIER_COUNT = 15
 
-FLAG_PATH = '/home/orangepi/tracking_enabled.flag'
-OFFSETS_FILE = '/home/orangepi/offsets.json'
+FLAG_PATH = 'tracking_enabled.flag'
+OFFSETS_FILE = 'offsets.json'
 ROI = None
 
 SAVE_MODE = 'last'
@@ -121,7 +123,7 @@ class FastBriskDetector:
         self.max_features = max_features
         self.fast = cv2.FastFeatureDetector_create(threshold=10, nonmaxSuppression=True)
         self.brisk = cv2.BRISK_create()
-        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
 
     def detect(self, gray):
         if gray is None:
@@ -204,24 +206,38 @@ class RobustTracker:
             
         return new_pts, inliers, smoothed_center
 
-# ----------------- Продвинутая логика лесенки -----------------
-def rope_ladder_waypoint_management(waypoints, current_center, anchor_center_fixed, distance_threshold=DISTANCE_THRESHOLD):
+# ----------------- Продвинутая логика лесенки с центром масс точек -----------------
+def rope_ladder_waypoint_management(waypoints, current_center, anchor_center_fixed, tracked_pts, distance_threshold=DISTANCE_THRESHOLD):
+    """
+    Управление лестницей с центром масс точек внутри каждого waypoint.
+    
+    Args:
+        waypoints: Список точек лестницы
+        current_center: Текущий отфильтрованный центр
+        anchor_center_fixed: Фиксированная начальная точка
+        tracked_pts: Массив текущих трекаемых точек
+    """
     if len(waypoints) == 0:
         return waypoints
 
+    # Рассчитываем центр масс текущего кадра
     current_to_anchor = np.linalg.norm(current_center - anchor_center_fixed)
     last_center = waypoints[-1]['center']
     last_to_anchor = np.linalg.norm(last_center - anchor_center_fixed)
     
     # Добавление новой ступеньки
     if current_to_anchor > last_to_anchor + BACKTRACK_MARGIN:
+        # Создаем новый waypoint с центром масс текущих точек
+        new_waypoint_center = np.mean(tracked_pts, axis=0)  # Центр масс всех трекаемых точек
+        
         wp = {
-            'center': current_center.copy(),
+            'center': new_waypoint_center.copy(),
             'timestamp': time.time(),
-            'cumulative': waypoints[-1]['cumulative'] + (current_center - last_center)
+            'cumulative': waypoints[-1]['cumulative'] + (new_waypoint_center - last_center),
+            'points': tracked_pts.copy()  # Сохраняем все точки для будущих расчетов
         }
         waypoints.append(wp)
-        logging.info("➕ Добавлена новая точка лестницы")
+        logging.info(f"➕ Добавлена новая точка лестницы с центром масс {new_waypoint_center}")
     
     # Возврат к предыдущей ступеньке
     elif len(waypoints) > 1:
@@ -278,12 +294,18 @@ def main():
             if not tracking_active:
                 pts = detector.detect(gray)
                 if pts is not None and len(pts) >= MIN_FEATURES:
-                    waypoints = [{'center': np.mean(pts, axis=0), 'cumulative': np.array([0.0, 0.0])}]
-                    anchor_center_fixed = waypoints[0]['center'].copy()
+                    # Инициализация первого waypoint с центром масс начальных точек
+                    initial_center = np.mean(pts, axis=0)
+                    waypoints = [{
+                        'center': initial_center.copy(), 
+                        'cumulative': np.array([0.0, 0.0]), 
+                        'points': pts.copy()
+                    }]
+                    anchor_center_fixed = initial_center.copy()
                     tracked_pts = pts
                     prev_gray = gray.copy()
                     kalman = EnhancedKalman2D(process_noise=1e-3, measurement_noise=1e-1)
-                    kalman.correct_and_predict(anchor_center_fixed)
+                    kalman.correct_and_predict(initial_center)
                     tracking_active = True
                     logging.info(f"🟢 Трекинг запущен. Якорь: {anchor_center_fixed}")
                 else:
@@ -302,8 +324,12 @@ def main():
                     prev_gray = gray.copy()
                     continue
                 else:
-                    avg_dx = int(round(sum(x for x, y in offset_buffer) / len(offset_buffer)))
-                    avg_dy = int(round(sum(y for x, y in offset_buffer) / len(offset_buffer)))
+                    # При потере трекинга используем последнее известное смещение
+                    if offset_buffer:
+                        avg_dx = int(round(sum(x for x, y in offset_buffer) / len(offset_buffer)))
+                        avg_dy = int(round(sum(y for x, y in offset_buffer) / len(offset_buffer)))
+                    else:
+                        avg_dx, avg_dy = 0, 0
                     save_offset(avg_dx, avg_dy, 0.0, in_meters=False)
                     continue
 
@@ -314,33 +340,34 @@ def main():
                 dx_px, dy_px = 0, 0
                 avg_dx, avg_dy = 0, 0
             else:
+                # Фильтрация Калманом
                 kalmed = kalman.correct_and_predict(smoothed_center)
-                last_center = waypoints[-1]['center']
-                offset = kalmed - last_center
                 
-                if SAVE_MODE == 'last':
+                # Обновление waypoints
+                now = time.time()
+                if now - last_update_time >= LADDER_UPDATE_INTERVAL:
+                    waypoints = rope_ladder_waypoint_management(waypoints, kalmed, anchor_center_fixed, new_pts)
+                    last_update_time = now
+                
+                # Рассчитываем смещение относительно последнего waypoint
+                if len(waypoints) > 0:
+                    last_waypoint_center = waypoints[-1]['center']
+                    offset = kalmed - last_waypoint_center
                     dx_px, dy_px = int(offset[0]), int(offset[1])
                 else:
-                    total = waypoints[-1]['cumulative'] + offset
-                    dx_px, dy_px = int(total[0]), int(total[1])
-                    
-                # === СГЛАЖИВАНИЕ ЧЕРЕЗ СРЕДНЕЕ ПО 20 КАДРАМ ===
+                    dx_px, dy_px = 0, 0
+                
+                # Сглаживание через буфер
                 offset_buffer.append((dx_px, dy_px))
-
                 avg_dx = int(round(sum(x for x, y in offset_buffer) / len(offset_buffer)))
                 avg_dy = int(round(sum(y for x, y in offset_buffer) / len(offset_buffer)))
 
+                # Сохранение смещения
                 if SAVE_IN_METERS and CURRENT_HEIGHT_M is not None:
                     dx_m, dy_m = px_to_m(avg_dx, avg_dy, CURRENT_HEIGHT_M)
                     save_offset(dx_m, dy_m, angle_deg, in_meters=True)
                 else:
                     save_offset(avg_dx, avg_dy, angle_deg, in_meters=False)
-
-            # Обновление лестницы
-            now = time.time()
-            if now - last_update_time >= LADDER_UPDATE_INTERVAL:
-                rope_ladder_waypoint_management(waypoints, smoothed_center, anchor_center_fixed)
-                last_update_time = now
 
             # Визуализация
             if DEBUG:
@@ -351,7 +378,7 @@ def main():
                     cv2.putText(debug_frame, f"W{i}", (center[0]+5, center[1]-5), 
                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
                 
-                # Исправление предупреждения: извлекаем скалярные значения
+                # Визуализация отфильтрованного положения
                 state = kalman.kf.statePost[:2].flatten()
                 kalmed_int = (int(state[0]), int(state[1]))
                 cv2.circle(debug_frame, kalmed_int, 8, (0,0,255), -1)

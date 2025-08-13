@@ -191,55 +191,80 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     import json
     import time
     from pymavlink import mavutil
+    from collections import deque
+
     # CRSF параметры
     CENTER_TICKS = 992
     MIN_TICKS = 172
     MAX_TICKS = 1811
-   
-    # Сглаживание
+
+    # Сглаживание offset'ов
     smoothed_offset_x = 0.0
     smoothed_offset_y = 0.0
     final_smoothed_x = 0.0
     final_smoothed_y = 0.0
-    SMOOTHING_FACTOR_OFFSET = 0.2  # 0.0 - нет реакции, 1.0 - без сглаживания
+    SMOOTHING_FACTOR_OFFSET = 0.2
+    alpha = 0.3  # второе сглаживание
 
-    # Кадр (используем весь)
+    # Размеры кадра
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
-    
-    # Mavlink получение высоты в метрах
-    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="115200", timeout=0)
-    
-    # === Переменные для высоты ===
-    target_alt = None          # Целевая высота (устанавливается при старте)
-    max_correction = 300 # Максимальная коррекция ±100 тиков
-    Kp = 400.0                  # Коэффициент P-регулятора (подбирается)
 
-    # Буфер для хранения последних смещений (dx, dy)
+    # Mavlink подключение
+    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="57600", timeout=0)
+
+    # === Параметры высоты ===
+    ALT_MAX_CHANGE = 2.0          # м/с — защита от скачков
+    EMA_ALPHA = 0.3               # EMA-фильтр
+    KP = 1.0                      # пропорциональный коэффициент (м/с на метр ошибки)
+    KI = 0.05                     # интегральный коэффициент
+    MAX_VERTICAL_SPEED = 2.0      # макс. целевая скорость (м/с)
+    MAX_CORRECTION_TICKS = 200    # макс. коррекция газа за шаг (защита от рывков)
+    THROTTLE_BASE = channels_old[2]          # базовый газ для зависания (можно настроить)
+    ALT_DEADZONE = 0.05  # 5 см
+    
+    # Буферы
     OFFSET_BUFFER_SIZE = 20
     offset_buffer = deque(maxlen=OFFSET_BUFFER_SIZE)
-    
-    # Фильтр высоты
-    altitude_history = []
-    MAX_HISTORY = 5
-    
-    # Предыдущая высота (защита от скачков)
+    MAX_HISTORY = 10
+    altitude_history = deque(maxlen=MAX_HISTORY)
+
+    # --- Состояние ---
+    target_alt = None
     last_alt = 0.0
-    ALT_MAX_CHANGE = 0.5  # м/с — макс. разрешённое изменение за шаг
+    filtered_alt = 0.0
+    integral_error = 0.0
+    last_time = time.time()
+
+    def filter_altitude(raw_alt, dt):
+        """EMA-фильтр + защита от скачков"""
+        nonlocal filtered_alt, last_alt
+        if abs(raw_alt - last_alt) > ALT_MAX_CHANGE * dt:
+            raw_alt = last_alt + ALT_MAX_CHANGE * dt * (1 if raw_alt > last_alt else -1)
+        filtered_alt = EMA_ALPHA * raw_alt + (1 - EMA_ALPHA) * filtered_alt
+        last_alt = filtered_alt
+        return filtered_alt
 
     while not stop_event.is_set():
-        
+        current_time = time.time()
+        dt = current_time - last_time
+        if dt < 0.01:  # мин. интервал
+            time.sleep(0.005)
+            continue
+        last_time = current_time
+
         # === Получение высоты из MAVLink ===
         msg = mav_connection.recv_match(type='VFR_HUD', blocking=False)
-        
+        #print(msg)
         current_alt = None
+
         if msg:
             raw_alt = msg.alt
 
             # --- Фильтр 1: игнорировать 0.0 после старта ---
             if target_alt is not None and abs(raw_alt) < 0.01:
                 print(f"🟡 Пропуск alt=0.0 (ложный сброс)")
-                raw_alt = last_alt  # использовать предыдущее
+                raw_alt = last_alt
 
             # --- Фильтр 2: ограничить скорость изменения ---
             if abs(raw_alt - last_alt) > ALT_MAX_CHANGE:
@@ -248,30 +273,54 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
 
             # --- Фильтр 3: скользящее среднее ---
             altitude_history.append(raw_alt)
-            if len(altitude_history) > MAX_HISTORY:
-                altitude_history.pop(0)
-            
             current_alt = sum(altitude_history) / len(altitude_history)
-            last_alt = current_alt  # обновить для следующей итерации
+            last_alt = current_alt
 
-            # --- Установить целевую высоту (только при первом валидном значении) ---
-            if target_alt is None and abs(current_alt) < 5.0:  # не 0 и не мусор
+            # --- Установка целевой высоты (один раз) ---
+            if target_alt is None and 0.1 < abs(current_alt) < 10.0:
                 target_alt = current_alt
+                integral_error = 0.0  # сброс интегратора
                 print(f"🎯 Целевая высота установлена: {target_alt:.2f} м")
-                # Установим начальный газ, чтобы дрон мог зависнуть
                 if channels_old[2] < 900:
-                    channels_old[2] = 1100  # начальный газ
+                    channels_old[2] = THROTTLE_BASE
 
-            # --- Считаем ошибку и коррекцию ---
-            error = target_alt - current_alt
-            correction_ticks = int(error * Kp)
-            correction_ticks = max(-max_correction, min(max_correction, correction_ticks))
+            # === PI-регулятор высоты ===
+            if target_alt is not None:
+                error = target_alt - current_alt
 
-            print(f"📍 Высота: {current_alt:.2f}м | Ошибка: {error:.2f}м | Корр: {correction_ticks:+3d} | Газ: {channels_old[2]}")
+                # P-член
+                p_term = KP * error
+
+                # I-член (с анти-насыщением)
+                # Deadzone: не реагируем на мелкие отклонения
+                if abs(error) < ALT_DEADZONE:
+                    error = 0.0
+                    integral_error = 0.0  # 🔥 СБРОС ИНТЕГРАТОРА!
+                else:
+                    integral_error += error * dt
+                    # Ограничиваем интегратор, чтобы не было насыщения
+                    integral_error = max(-0.4, min(0.4, integral_error))
+                i_term = KI * integral_error
+
+                # Целевая вертикальная скорость (м/с)
+                desired_climb_rate = p_term + i_term
+                desired_climb_rate = max(-MAX_VERTICAL_SPEED, min(MAX_VERTICAL_SPEED, desired_climb_rate))
+
+                # Преобразуем в коррекцию газа
+                # Например: 1 м/с = +100 тиков газа
+                throttle_correction = int(desired_climb_rate * 100)  # настройка под дрон!
+                throttle_correction = max(-MAX_CORRECTION_TICKS, min(MAX_CORRECTION_TICKS, throttle_correction))
+
+                # Основа: либо текущий газ, либо базовый
+                base_throttle = channels_old[2] if channels_old[2] > 900 else THROTTLE_BASE
+                new_throttle = base_throttle + throttle_correction
+                channels_old[2] = max(MIN_TICKS, min(MAX_TICKS, new_throttle))
+
+                print(f"📍 Высота: {current_alt:.2f}м | Цель: {target_alt:.2f}м | "
+                      f"Ошибка: {error:.2f}м | Скорость: {desired_climb_rate:+.2f}м/с | "
+                      f"Корр: {throttle_correction:+4d} | Газ: {channels_old[2]}")
 
         else:
-            # Нет данных — не меняем газ
-            correction_ticks = 0
             print("🟡 Нет данных VFR_HUD")
 
         # === Чтение offsets.json (roll/pitch) ===
@@ -281,53 +330,47 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
                 new_offset_x = offsets.get('x', 0)
                 new_offset_y = offsets.get('y', 0)
                 angle = offsets.get('angle', 0)
-        except:
+        except Exception as e:
             new_offset_x = 0
             new_offset_y = 0
             angle = 0
 
-        #Первое сглаживание (от трекера)
+        # Первое сглаживание (от трекера)
         smoothed_offset_x = SMOOTHING_FACTOR_OFFSET * new_offset_x + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_x
         smoothed_offset_y = SMOOTHING_FACTOR_OFFSET * new_offset_y + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_y
-
-        #Второе сглаживание (для каналов)
-        alpha = 0.3  # Можно уменьшить до 0.2 для ещё большей стабильности
+        """
+        # Второе сглаживание (для каналов)
         final_smoothed_x = alpha * smoothed_offset_x + (1 - alpha) * final_smoothed_x
         final_smoothed_y = alpha * smoothed_offset_y + (1 - alpha) * final_smoothed_y
 
-        #Ограничение максимального смещения (защита от выбросов)
-        MAX_ALLOWED_OFFSET = 150  # пикселей (эквивалент ~150 тиков)
+        # Ограничение максимального смещения
+        MAX_ALLOWED_OFFSET = 150
         final_smoothed_x = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_x))
         final_smoothed_y = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_y))
-
-        # Перевод в тики
-        channels_old[0] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-final_smoothed_x))))
-        channels_old[1] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-final_smoothed_y))))
-        
-        # === КОРРЕКЦИЯ ГАЗА НА ОСНОВЕ ВЫСОТЫ ===
-        # Используем ТЕКУЩЕЕ значение channels_old[2] как базу
-        new_throttle = channels_old[2] + correction_ticks
-        channels_old[2] = (max(MIN_TICKS, min(MAX_TICKS, new_throttle)))
-        print(f"channels_old_2:{channels_old[2]}")
         """
-        # --- Поворот по углу (если нужен возврат по ориентации) ---
+        # Перевод в тики
+        channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-smoothed_offset_x)))
+        channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-smoothed_offset_y)))
 
+        # === Yaw (опционально) ===
+        """
         DEADZONE_ANGLE = 3
         if abs(angle) > DEADZONE_ANGLE:
-            MAX_DEFLECTION_TICKS = 400
-            yaw_error_limited = max(-30, min(30, angle))
-            yaw_normalized = yaw_error_limited / 30.0
-            yaw_ticks = int(yaw_normalized * MAX_DEFLECTION_TICKS)
+            yaw_normalized = angle / 30.0
+            yaw_ticks = int(yaw_normalized * 400)
             channels_old[3] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + yaw_ticks))
         else:
             channels_old[3] = CENTER_TICKS
         """
 
+        # === Отправка CRSF ===
         packed_channels = pack_channels(channels_old)
         data_without_crc_old[3:25] = packed_channels
         crc = crc8(data_without_crc_old[2:25])
         updated_data = data_without_crc_old + [crc]
         uart4.write(bytes(updated_data))
+
+        time.sleep(0.01)
 
     global is_thread_running
     is_thread_running = False
