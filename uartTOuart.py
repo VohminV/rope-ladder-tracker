@@ -208,40 +208,72 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     FRAME_HEIGHT = 480
     
     # Mavlink получение высоты в метрах
-    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="57600", timeout=0)
+    mav_connection = mavutil.mavlink_connection("/dev/ttyS0", baud="115200", timeout=0)
     
     # === Переменные для высоты ===
     target_alt = None          # Целевая высота (устанавливается при старте)
-    max_correction_ticks = 100 # Максимальная коррекция ±100 тиков
-    Kp = 80.0                  # Коэффициент P-регулятора (подбирается)
+    max_correction = 300 # Максимальная коррекция ±100 тиков
+    Kp = 400.0                  # Коэффициент P-регулятора (подбирается)
 
     # Буфер для хранения последних смещений (dx, dy)
     OFFSET_BUFFER_SIZE = 20
     offset_buffer = deque(maxlen=OFFSET_BUFFER_SIZE)
-
+    
+    # Фильтр высоты
+    altitude_history = []
+    MAX_HISTORY = 5
+    
+    # Предыдущая высота (защита от скачков)
+    last_alt = 0.0
+    ALT_MAX_CHANGE = 0.5  # м/с — макс. разрешённое изменение за шаг
 
     while not stop_event.is_set():
         
         # === Получение высоты из MAVLink ===
-        msg = mav_connection.recv_match(type='ALTITUDE', blocking=False)
-        if msg is not None:
-            current_alt =  msg.relative_alt / 1000.0  # в метрах
+        msg = mav_connection.recv_match(type='VFR_HUD', blocking=False)
+        
+        current_alt = None
+        if msg:
+            raw_alt = msg.alt
 
-            # ✅ Установка целевой высоты ТОЛЬКО ПРИ ВКЛЮЧЕНИИ
-            if target_alt is None and correction_active:
+            # --- Фильтр 1: игнорировать 0.0 после старта ---
+            if target_alt is not None and abs(raw_alt) < 0.01:
+                print(f"🟡 Пропуск alt=0.0 (ложный сброс)")
+                raw_alt = last_alt  # использовать предыдущее
+
+            # --- Фильтр 2: ограничить скорость изменения ---
+            if abs(raw_alt - last_alt) > ALT_MAX_CHANGE:
+                print(f"⚠️ Скачок высоты: {last_alt:.2f} → {raw_alt:.2f}, исправлено")
+                raw_alt = last_alt + ALT_MAX_CHANGE * (1 if raw_alt > last_alt else -1)
+
+            # --- Фильтр 3: скользящее среднее ---
+            altitude_history.append(raw_alt)
+            if len(altitude_history) > MAX_HISTORY:
+                altitude_history.pop(0)
+            
+            current_alt = sum(altitude_history) / len(altitude_history)
+            last_alt = current_alt  # обновить для следующей итерации
+
+            # --- Установить целевую высоту (только при первом валидном значении) ---
+            if target_alt is None and abs(current_alt) < 5.0:  # не 0 и не мусор
                 target_alt = current_alt
                 print(f"🎯 Целевая высота установлена: {target_alt:.2f} м")
+                # Установим начальный газ, чтобы дрон мог зависнуть
+                if channels_old[2] < 900:
+                    channels_old[2] = 1100  # начальный газ
 
-                if target_alt is not None:
-                    error = target_alt - current_alt
-                    correction_ticks = int(error * Kp)
-                    correction_ticks = max(-max_correction_ticks, min(max_correction_ticks, correction_ticks))
-                else:
-                    correction_ticks = 0
+            # --- Считаем ошибку и коррекцию ---
+            error = target_alt - current_alt
+            correction_ticks = int(error * Kp)
+            correction_ticks = max(-max_correction, min(max_correction, correction_ticks))
+
+            print(f"📍 Высота: {current_alt:.2f}м | Ошибка: {error:.2f}м | Корр: {correction_ticks:+3d} | Газ: {channels_old[2]}")
+
         else:
-            # Если нет данных — не вносим коррекцию
+            # Нет данных — не меняем газ
             correction_ticks = 0
-        
+            print("🟡 Нет данных VFR_HUD")
+
         # === Чтение offsets.json (roll/pitch) ===
         try:
             with open('/home/orangepi/offsets.json', 'r') as f:
@@ -271,15 +303,15 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
         # Перевод в тики
         channels_old[0] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-final_smoothed_x))))
         channels_old[1] = (max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-final_smoothed_y))))
-
+        
         # === КОРРЕКЦИЯ ГАЗА НА ОСНОВЕ ВЫСОТЫ ===
         # Используем ТЕКУЩЕЕ значение channels_old[2] как базу
-        base_throttle = channels_old[2]  # ← Ключевая строка: сохраняем предыдущее значение
-        new_throttle = base_throttle + correction_ticks
-        channels_old[2] = max(MIN_TICKS, min(MAX_TICKS, new_throttle))
-
-        # --- Поворот по углу (если нужен возврат по ориентации) ---
+        new_throttle = channels_old[2] + correction_ticks
+        channels_old[2] = (max(MIN_TICKS, min(MAX_TICKS, new_throttle)))
+        print(f"channels_old_2:{channels_old[2]}")
         """
+        # --- Поворот по углу (если нужен возврат по ориентации) ---
+
         DEADZONE_ANGLE = 3
         if abs(angle) > DEADZONE_ANGLE:
             MAX_DEFLECTION_TICKS = 400
