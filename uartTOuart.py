@@ -220,7 +220,6 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     KI = 0.05                     # интегральный коэффициент
     MAX_VERTICAL_SPEED = 2.0      # макс. целевая скорость (м/с)
     MAX_CORRECTION_TICKS = 200    # макс. коррекция газа за шаг (защита от рывков)
-    THROTTLE_BASE = channels_old[2]          # базовый газ для зависания (можно настроить)
     ALT_DEADZONE = 0.05  # 5 см
     
     # Буферы
@@ -235,7 +234,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
     filtered_alt = 0.0
     integral_error = 0.0
     last_time = time.time()
-
+    THROTTLE_BASE = channels_old[2]
     def filter_altitude(raw_alt, dt):
         """EMA-фильтр + защита от скачков"""
         nonlocal filtered_alt, last_alt
@@ -279,6 +278,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
             # --- Установка целевой высоты (один раз) ---
             if target_alt is None and 0.1 < abs(current_alt) < 10.0:
                 target_alt = current_alt
+                THROTTLE_BASE = channels_old[2] # базовый газ для зависания (можно настроить)
                 integral_error = 0.0  # сброс интегратора
                 print(f"🎯 Целевая высота установлена: {target_alt:.2f} м")
                 if channels_old[2] < 900:
@@ -312,8 +312,7 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
                 throttle_correction = max(-MAX_CORRECTION_TICKS, min(MAX_CORRECTION_TICKS, throttle_correction))
 
                 # Основа: либо текущий газ, либо базовый
-                base_throttle = channels_old[2] if channels_old[2] > 900 else THROTTLE_BASE
-                new_throttle = base_throttle + throttle_correction
+                new_throttle = THROTTLE_BASE + throttle_correction
                 channels_old[2] = max(MIN_TICKS, min(MAX_TICKS, new_throttle))
 
                 print(f"📍 Высота: {current_alt:.2f}м | Цель: {target_alt:.2f}м | "
@@ -330,27 +329,34 @@ def update_rc_channels_in_background(channels_old, uart4, data_without_crc_old):
                 new_offset_x = offsets.get('x', 0)
                 new_offset_y = offsets.get('y', 0)
                 angle = offsets.get('angle', 0)
+                
+                # Проверка на разумные значения
+                if abs(new_offset_x) > 300 or abs(new_offset_y) > 300:
+                    logging.warning(f"Подозрительные значения offsets: x={new_offset_x}, y={new_offset_y}")
+                    new_offset_x = 0
+                    new_offset_y = 0
         except Exception as e:
             new_offset_x = 0
             new_offset_y = 0
             angle = 0
 
-        # Первое сглаживание (от трекера)
-        smoothed_offset_x = SMOOTHING_FACTOR_OFFSET * new_offset_x + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_x
-        smoothed_offset_y = SMOOTHING_FACTOR_OFFSET * new_offset_y + (1 - SMOOTHING_FACTOR_OFFSET) * smoothed_offset_y
-        """
-        # Второе сглаживание (для каналов)
-        final_smoothed_x = alpha * smoothed_offset_x + (1 - alpha) * final_smoothed_x
-        final_smoothed_y = alpha * smoothed_offset_y + (1 - alpha) * final_smoothed_y
+        # === Сглаживание с ограничением ===
+        SMOOTHING_FACTOR = 0.3  # Более сильное сглаживание для плавности
+        MAX_OFFSET = 100  # Ограничение максимального отклонения
 
-        # Ограничение максимального смещения
-        MAX_ALLOWED_OFFSET = 150
-        final_smoothed_x = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_x))
-        final_smoothed_y = max(-MAX_ALLOWED_OFFSET, min(MAX_ALLOWED_OFFSET, final_smoothed_y))
-        """
-        # Перевод в тики
-        channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-smoothed_offset_x)))
-        channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-smoothed_offset_y)))
+        # Применяем сглаживание
+        smoothed_offset_x = SMOOTHING_FACTOR * new_offset_x + (1 - SMOOTHING_FACTOR) * smoothed_offset_x
+        smoothed_offset_y = SMOOTHING_FACTOR * new_offset_y + (1 - SMOOTHING_FACTOR) * smoothed_offset_y
+
+        # Ограничиваем значения
+        smoothed_offset_x = max(-MAX_OFFSET, min(MAX_OFFSET, smoothed_offset_x))
+        smoothed_offset_y = max(-MAX_OFFSET, min(MAX_OFFSET, smoothed_offset_y))
+
+        # === Перевод в тики с ПРАВИЛЬНОЙ инверсией ===
+        # Если камера ушла вправо (положительный offset_x), квадрокоптер должен наклониться влево (отрицательный канал)
+        GAIN = 0.7  # Коэффициент усиления (0.5-0.8)
+        channels_old[0] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-smoothed_offset_x * GAIN)))  # roll
+        channels_old[1] = max(MIN_TICKS, min(MAX_TICKS, CENTER_TICKS + int(-smoothed_offset_y * GAIN)))  # pitch
 
         # === Yaw (опционально) ===
         """

@@ -35,8 +35,8 @@ LADDER_UPDATE_INTERVAL = 0.8
 INLIER_SAVE_RATIO = 0.5
 MIN_INLIER_COUNT = 15
 
-FLAG_PATH = 'tracking_enabled.flag'
-OFFSETS_FILE = 'offsets.json'
+FLAG_PATH = '/home/orangepi/tracking_enabled.flag'
+OFFSETS_FILE = '/home/orangepi/offsets.json'
 ROI = None
 
 SAVE_MODE = 'last'
@@ -44,10 +44,6 @@ DEBUG = False
 SAVE_IN_METERS = False
 CURRENT_HEIGHT_M = None
 CAMERA_FOV_DEG = 70.0
-
-# Буфер для хранения последних смещений (dx, dy)
-OFFSET_BUFFER_SIZE = 20
-offset_buffer = deque(maxlen=OFFSET_BUFFER_SIZE)
 
 # Логирование
 logging.basicConfig(
@@ -324,21 +320,14 @@ def main():
                     prev_gray = gray.copy()
                     continue
                 else:
-                    # При потере трекинга используем последнее известное смещение
-                    if offset_buffer:
-                        avg_dx = int(round(sum(x for x, y in offset_buffer) / len(offset_buffer)))
-                        avg_dy = int(round(sum(y for x, y in offset_buffer) / len(offset_buffer)))
-                    else:
-                        avg_dx, avg_dy = 0, 0
-                    save_offset(avg_dx, avg_dy, 0.0, in_meters=False)
+                    logging.warning("Потеря трекинга - пропуск записи offsets")
                     continue
-
             # Проверка inliers
+            """
             min_inliers = max(MIN_INLIER_COUNT, len(new_pts) * INLIER_SAVE_RATIO)
             if inliers < min_inliers:
                 logging.warning(f"Низкие inliers ({inliers} < {min_inliers}) -> пропуск")
-                dx_px, dy_px = 0, 0
-                avg_dx, avg_dy = 0, 0
+                pass
             else:
                 # Фильтрация Калманом
                 kalmed = kalman.correct_and_predict(smoothed_center)
@@ -355,7 +344,7 @@ def main():
                     offset = kalmed - last_waypoint_center
                     dx_px, dy_px = int(offset[0]), int(offset[1])
                 else:
-                    dx_px, dy_px = 0, 0
+                    pass
                 
                 # Сглаживание через буфер
                 offset_buffer.append((dx_px, dy_px))
@@ -368,7 +357,31 @@ def main():
                     save_offset(dx_m, dy_m, angle_deg, in_meters=True)
                 else:
                     save_offset(avg_dx, avg_dy, angle_deg, in_meters=False)
-
+                    """
+            min_inliers = max(MIN_INLIER_COUNT, len(new_pts) * INLIER_SAVE_RATIO)
+            if inliers < min_inliers:
+                logging.warning(f"Низкие inliers ({inliers} < {min_inliers}) -> пропуск")
+                pass
+            else:
+                # Фильтрация Калманом
+                kalmed = kalman.correct_and_predict(smoothed_center)
+                
+                # Обновление waypoints
+                now = time.time()
+                if now - last_update_time >= LADDER_UPDATE_INTERVAL:
+                    waypoints = rope_ladder_waypoint_management(waypoints, kalmed, anchor_center_fixed, new_pts)
+                    last_update_time = now
+                
+                # Рассчитываем смещение относительно последнего waypoint
+                if len(waypoints) > 0 and len(new_pts) > 0:
+                    last_waypoint_center = waypoints[-1]['center']
+                    offset = kalmed - last_waypoint_center
+                    dx_px, dy_px = int(offset[0]), int(offset[1])
+                    
+                    save_offset(dx_px, dy_px, angle_deg, in_meters=False)
+                else:
+                    # waypoints пустой или нет точек - ничего не делаем
+                    pass
             # Визуализация
             if DEBUG:
                 debug_frame = frame.copy()
